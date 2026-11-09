@@ -1,0 +1,25 @@
+{
+  "name": "deep-pdf-editor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A fully client-side PDF editor that edits real PDF content streams, preserving original fonts.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "release": "npm run build && mkdir -p release && cp dist/index.html release/deep-pdf-editor.html",
+    "preview": "vite preview",
+    "fixtures": "node --experimental-strip-types tests/make-fixtures.ts",
+    "test": "node --experimental-strip-types tests/engine.test.ts && node --experimental-strip-types tests/stress.test.ts"
+  },
+  "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "4.10.38"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.1.0"
+  }
+}

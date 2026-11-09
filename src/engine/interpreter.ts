@@ -1,0 +1,358 @@
+/**
+ * Content-stream interpreter. Tracks the graphics/text state exactly like a
+ * PDF renderer would, and records every text-showing operator and XObject
+ * placement with its byte range, font, matrices and colour.
+ */
+import { PDFArray, PDFDict, PDFName, PDFRef, type PDFDocument, type PDFObject, type PDFPage } from 'pdf-lib';
+import { parseContent, type Operand, type Operation } from './lexer.ts';
+import { FontCache, type PdfFont, type Glyph } from './fonts.ts';
+import { dictGet, getDict, getName, resolve, streamBytes } from './pdfobj.ts';
+
+export type Matrix = [number, number, number, number, number, number];
+export const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
+
+export function mul(m1: Matrix, m2: Matrix): Matrix {
+  const [a1, b1, c1, d1, e1, f1] = m1;
+  const [a2, b2, c2, d2, e2, f2] = m2;
+  return [
+    a1 * a2 + b1 * c2,
+    a1 * b2 + b1 * d2,
+    c1 * a2 + d1 * c2,
+    c1 * b2 + d1 * d2,
+    e1 * a2 + f1 * c2 + e2,
+    e1 * b2 + f1 * d2 + f2,
+  ];
+}
+export function apply(m: Matrix, x: number, y: number): [number, number] {
+  return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+}
+export function invert(m: Matrix): Matrix {
+  const [a, b, c, d, e, f] = m;
+  const det = a * d - b * c || 1e-12;
+  return [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det];
+}
+
+export interface FillColor {
+  op: 'g' | 'rg' | 'k' | 'scn';
+  cs?: string;
+  comps: number[];
+  pattern?: string;
+}
+
+export interface BBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface TextRun {
+  id: string;
+  stream: number;
+  opIndex: number;
+  start: number;
+  end: number;
+  op: string;
+  /** operands of the " operator */
+  quoteArgs?: [number, number];
+  fontKey: string;
+  font: PdfFont;
+  fs: number;
+  Tc: number;
+  Tw: number;
+  Th: number;
+  TL: number;
+  Ts: number;
+  Tr: number;
+  ctm: Matrix;
+  /** text matrix at the start of showing */
+  tm: Matrix;
+  glyphs: Glyph[];
+  text: string;
+  /** total x displacement in text space */
+  advance: number;
+  color: FillColor;
+  bt: number;
+  quad: [number, number][];
+  bbox: BBox;
+}
+
+export interface XObjectRun {
+  id: string;
+  stream: number;
+  opIndex: number;
+  start: number;
+  end: number;
+  name: string;
+  subtype: 'Image' | 'Form' | 'Inline';
+  ctm: Matrix;
+  quad: [number, number][];
+  bbox: BBox;
+}
+
+export interface ContentStreamInfo {
+  ref?: PDFRef;
+  bytes: Uint8Array;
+  ops: Operation[];
+}
+
+export interface PageModel {
+  streams: ContentStreamInfo[];
+  runs: TextRun[];
+  xobjects: XObjectRun[];
+  groups: TextGroup[];
+}
+
+export interface TextGroup {
+  id: string;
+  runs: TextRun[];
+  text: string;
+  bbox: BBox;
+  quad: [number, number][];
+  /** rotation (radians) of the baseline in user space */
+  angle: number;
+  /** font size as seen in user space */
+  visualSize: number;
+}
+
+interface GState {
+  ctm: Matrix;
+  fill: FillColor;
+  fillCS: string;
+  Tc: number;
+  Tw: number;
+  Th: number;
+  TL: number;
+  Ts: number;
+  Tr: number;
+  fontKey: string;
+  font?: PdfFont;
+  fs: number;
+}
+
+const num = (o: Operand | undefined) => (o && o.kind === 'num' ? o.value : 0);
+
+function quadToBBox(q: [number, number][]): BBox {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of q) {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  }
+  return { x0, y0, x1, y1 };
+}
+
+export function getContentStreams(doc: PDFDocument, page: PDFPage): ContentStreamInfo[] {
+  const ctx = doc.context;
+  const raw = page.node.get(PDFName.of('Contents'));
+  const out: ContentStreamInfo[] = [];
+  const add = (o: PDFObject | undefined) => {
+    const bytes = streamBytes(ctx, o) ?? new Uint8Array();
+    out.push({ ref: o instanceof PDFRef ? o : undefined, bytes, ops: [] });
+  };
+  const r = resolve(ctx, raw);
+  if (r instanceof PDFArray) for (let i = 0; i < r.size(); i++) add(r.get(i));
+  else if (r) add(raw);
+  return out;
+}
+
+export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCache): PageModel {
+  const ctx = doc.context;
+  const page = doc.getPage(pageIndex);
+  const resources = page.node.Resources();
+  const fontDict = getDict(ctx, resources, 'Font');
+  const xobjDict = getDict(ctx, resources, 'XObject');
+  const streams = getContentStreams(doc, page);
+  const runs: TextRun[] = [];
+  const xobjects: XObjectRun[] = [];
+
+  let gs: GState = {
+    ctm: IDENTITY, fill: { op: 'g', comps: [0] }, fillCS: 'DeviceGray',
+    Tc: 0, Tw: 0, Th: 1, TL: 0, Ts: 0, Tr: 0, fontKey: '', fs: 0,
+  };
+  const stack: GState[] = [];
+  let tm: Matrix = IDENTITY;
+  let tlm: Matrix = IDENTITY;
+  let bt = 0;
+  const usedFonts = new Set<PdfFont>();
+
+  const show = (s: number, i: number, op: Operation, items: Operand[], quoteArgs?: [number, number]) => {
+    const font = gs.font;
+    if (!font) return;
+    usedFonts.add(font);
+    const startTm = tm;
+    const glyphs: Glyph[] = [];
+    let adv = 0;
+    let minX = 0, maxX = 0;
+    for (const it of items) {
+      if (it.kind === 'num') {
+        adv += (-it.value / 1000) * gs.fs * gs.Th;
+      } else if (it.kind === 'str') {
+        for (const g of font.decode(it.bytes)) {
+          glyphs.push(g);
+          adv += ((g.width / 1000) * gs.fs + gs.Tc + (g.isSpace ? gs.Tw : 0)) * gs.Th;
+        }
+      }
+      minX = Math.min(minX, adv);
+      maxX = Math.max(maxX, adv);
+    }
+    tm = mul([1, 0, 0, 1, adv, 0], tm);
+    const m = mul(startTm, gs.ctm);
+    const top = gs.Ts + (font.ascent / 1000) * gs.fs;
+    const bot = gs.Ts + (font.descent / 1000) * gs.fs;
+    const quad: [number, number][] = [apply(m, minX, bot), apply(m, maxX, bot), apply(m, maxX, top), apply(m, minX, top)];
+    runs.push({
+      id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, op: op.op, quoteArgs,
+      fontKey: gs.fontKey, font, fs: gs.fs, Tc: gs.Tc, Tw: gs.Tw, Th: gs.Th, TL: gs.TL, Ts: gs.Ts, Tr: gs.Tr,
+      ctm: gs.ctm, tm: startTm, glyphs, text: glyphs.map((g) => g.unicode).join(''), advance: adv,
+      color: { ...gs.fill, comps: gs.fill.comps.slice() }, bt, quad, bbox: quadToBBox(quad),
+    });
+  };
+
+  streams.forEach((st, s) => {
+    st.ops = parseContent(st.bytes);
+    st.ops.forEach((op, i) => {
+      const a = op.operands;
+      switch (op.op) {
+        case 'q': stack.push({ ...gs }); break;
+        case 'Q': if (stack.length) gs = stack.pop()!; break;
+        case 'cm': gs.ctm = mul([num(a[0]), num(a[1]), num(a[2]), num(a[3]), num(a[4]), num(a[5])], gs.ctm); break;
+        case 'g': gs.fill = { op: 'g', comps: [num(a[0])] }; gs.fillCS = 'DeviceGray'; break;
+        case 'rg': gs.fill = { op: 'rg', comps: [num(a[0]), num(a[1]), num(a[2])] }; gs.fillCS = 'DeviceRGB'; break;
+        case 'k': gs.fill = { op: 'k', comps: [num(a[0]), num(a[1]), num(a[2]), num(a[3])] }; gs.fillCS = 'DeviceCMYK'; break;
+        case 'cs': {
+          const n = a[0]?.kind === 'name' ? a[0].value : 'DeviceGray';
+          gs.fillCS = n;
+          const comps = n === 'DeviceRGB' ? [0, 0, 0] : n === 'DeviceCMYK' ? [0, 0, 0, 1] : [0];
+          gs.fill = { op: 'scn', cs: n, comps };
+          break;
+        }
+        case 'sc': case 'scn': {
+          const comps = a.filter((x) => x.kind === 'num').map((x) => (x as { value: number }).value);
+          const pat = a.find((x) => x.kind === 'name') as { value: string } | undefined;
+          gs.fill = { op: 'scn', cs: gs.fillCS, comps, pattern: pat?.value };
+          break;
+        }
+        case 'BT': tm = IDENTITY; tlm = IDENTITY; bt++; break;
+        case 'ET': break;
+        case 'Tc': gs.Tc = num(a[0]); break;
+        case 'Tw': gs.Tw = num(a[0]); break;
+        case 'Tz': gs.Th = num(a[0]) / 100; break;
+        case 'TL': gs.TL = num(a[0]); break;
+        case 'Ts': gs.Ts = num(a[0]); break;
+        case 'Tr': gs.Tr = num(a[0]); break;
+        case 'Tf': {
+          const key = a[0]?.kind === 'name' ? a[0].value : '';
+          gs.fontKey = key;
+          gs.fs = num(a[1]);
+          gs.font = fontDict ? fonts.get(fontDict.get(PDFName.of(key))) : undefined;
+          break;
+        }
+        case 'Td': tlm = mul([1, 0, 0, 1, num(a[0]), num(a[1])], tlm); tm = tlm; break;
+        case 'TD': gs.TL = -num(a[1]); tlm = mul([1, 0, 0, 1, num(a[0]), num(a[1])], tlm); tm = tlm; break;
+        case 'Tm': tlm = [num(a[0]), num(a[1]), num(a[2]), num(a[3]), num(a[4]), num(a[5])]; tm = tlm; break;
+        case 'T*': tlm = mul([1, 0, 0, 1, 0, -gs.TL], tlm); tm = tlm; break;
+        case 'Tj': show(s, i, op, a.slice(0, 1)); break;
+        case 'TJ': show(s, i, op, a[0]?.kind === 'array' ? a[0].items : []); break;
+        case "'":
+          tlm = mul([1, 0, 0, 1, 0, -gs.TL], tlm); tm = tlm;
+          show(s, i, op, a.slice(0, 1));
+          break;
+        case '"':
+          gs.Tw = num(a[0]); gs.Tc = num(a[1]);
+          tlm = mul([1, 0, 0, 1, 0, -gs.TL], tlm); tm = tlm;
+          show(s, i, op, a.slice(2, 3), [num(a[0]), num(a[1])]);
+          break;
+        case 'Do': {
+          const name = a[0]?.kind === 'name' ? a[0].value : '';
+          const xo = xobjDict ? resolve(ctx, xobjDict.get(PDFName.of(name))) : undefined;
+          const d = xo && 'dict' in xo ? (xo as unknown as { dict: PDFDict }).dict : undefined;
+          const sub = d ? getName(ctx, d, 'Subtype') : undefined;
+          if (sub === 'Image' || sub === 'Form') {
+            let quad: [number, number][];
+            if (sub === 'Image') quad = [apply(gs.ctm, 0, 0), apply(gs.ctm, 1, 0), apply(gs.ctm, 1, 1), apply(gs.ctm, 0, 1)];
+            else {
+              const bb = dictGet(ctx, d, 'BBox');
+              let r = [0, 0, 1, 1];
+              if (bb instanceof PDFArray) r = bb.asArray().map((x) => Number((resolve(ctx, x) as { asNumber?: () => number })?.asNumber?.() ?? 0));
+              const fm = dictGet(ctx, d, 'Matrix');
+              let m: Matrix = IDENTITY;
+              if (fm instanceof PDFArray) m = fm.asArray().map((x) => Number((resolve(ctx, x) as { asNumber?: () => number })?.asNumber?.() ?? 0)) as Matrix;
+              const mm = mul(m, gs.ctm);
+              quad = [apply(mm, r[0], r[1]), apply(mm, r[2], r[1]), apply(mm, r[2], r[3]), apply(mm, r[0], r[3])];
+            }
+            xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name, subtype: sub, ctm: gs.ctm, quad, bbox: quadToBBox(quad) });
+          }
+          break;
+        }
+        case 'BI': {
+          const quad: [number, number][] = [apply(gs.ctm, 0, 0), apply(gs.ctm, 1, 0), apply(gs.ctm, 1, 1), apply(gs.ctm, 0, 1)];
+          xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name: '', subtype: 'Inline', ctm: gs.ctm, quad, bbox: quadToBBox(quad) });
+          break;
+        }
+      }
+    });
+  });
+  for (const f of usedFonts) f.touch();
+  return { streams, runs, xobjects, groups: groupRuns(runs) };
+}
+
+/**
+ * Merge consecutive runs that sit on the same baseline with the same font into
+ * editable "line" groups – PDFs often split a visual line into many operators.
+ */
+export function groupRuns(runs: TextRun[]): TextGroup[] {
+  const groups: TextGroup[] = [];
+  let cur: { runs: TextRun[]; text: string; inv: Matrix; endX: number; base: TextRun } | undefined;
+  const close = () => {
+    if (!cur) return;
+    const quad = groupQuad(cur.runs);
+    const m = mul(cur.base.tm, cur.base.ctm);
+    const angle = Math.atan2(m[1], m[0]);
+    const visualSize = Math.abs(cur.base.fs) * Math.hypot(m[2], m[3]);
+    groups.push({ id: cur.runs[0].id, runs: cur.runs, text: cur.text, bbox: quadToBBox(quad), quad, angle, visualSize });
+    cur = undefined;
+  };
+  for (const r of runs) {
+    if (r.glyphs.length === 0 && r.advance === 0) continue;
+    if (cur) {
+      const b = cur.base;
+      const same = sameFamily(r.font, b.font) && Math.abs(r.fs - b.fs) < 1e-3 && Math.abs(r.Th - b.Th) < 1e-3 && r.Tr === b.Tr;
+      if (same) {
+        const m = mul(r.tm, r.ctm);
+        const p = apply(cur.inv, m[4], m[5]);
+        // compare orientation
+        const bm = mul(b.tm, b.ctm);
+        const sameOrient = Math.abs(m[0] - bm[0]) + Math.abs(m[1] - bm[1]) + Math.abs(m[2] - bm[2]) + Math.abs(m[3] - bm[3]) < 0.02 * (Math.abs(bm[0]) + Math.abs(bm[3]) + 1e-6);
+        const fs = Math.abs(b.fs) || 1;
+        const gap = p[0] - cur.endX;
+        if (sameOrient && Math.abs(p[1]) < 0.2 * fs && gap > -0.3 * fs && gap < 0.9 * fs) {
+          const needSpace = gap > 0.18 * fs && !/\s$/.test(cur.text) && !/^\s/.test(r.text);
+          cur.text += (needSpace ? ' ' : '') + r.text;
+          cur.runs.push(r);
+          cur.endX = p[0] + r.advance;
+          continue;
+        }
+      }
+      close();
+    }
+    const m = mul(r.tm, r.ctm);
+    cur = { runs: [r], text: r.text, inv: invert(m), endX: r.advance, base: r };
+  }
+  close();
+  return groups;
+}
+
+function sameFamily(a: PdfFont, b: PdfFont): boolean {
+  return a === b || (a.displayName === b.displayName && a.subtype === b.subtype);
+}
+
+function groupQuad(runs: TextRun[]): [number, number][] {
+  const b = runs[0];
+  const m = mul(b.tm, b.ctm);
+  const inv = invert(m);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const r of runs) for (const pt of r.quad) {
+    const [x, y] = apply(inv, pt[0], pt[1]);
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  return [apply(m, minX, minY), apply(m, maxX, minY), apply(m, maxX, maxY), apply(m, minX, maxY)];
+}
