@@ -652,6 +652,11 @@ export class App {
     return v.page?.rotate ?? 0;
   }
 
+  /** fonts of the document a page belongs to (lets edits borrow glyphs from same-face subsets) */
+  fontPool(key: string) {
+    return this.sourceOf(key)?.src.fonts.all() ?? [];
+  }
+
   sourceOf(key: string): { src: SourceDoc; index: number } | undefined {
     if (key.startsWith('blank:')) return undefined;
     const [sid, idx] = key.split(':');
@@ -943,16 +948,16 @@ export class App {
     ed.textContent = cur.text ?? g.text;
     const status = h('div', { class: 'editor-status' });
     const updateStatus = () => {
-      const plan = planTextEdit(g, { ...cur, text: ed.textContent ?? '' });
+      const plan = planTextEdit(g, { ...cur, text: ed.textContent ?? '' }, this.fontPool(key));
       const bottom = r.top + r.height / 2 + size * 0.75;
       status.style.left = r.left + 'px';
       status.style.top = bottom + 4 + 'px';
       if (plan.mode === 'substitute') {
         status.className = 'editor-status warn';
-        status.textContent = `⚠ ${[...new Set(plan.missing)].join(' ')} not in embedded font “${font.displayName}” → line will use ${cur.fallbackFont?.startsWith('asset:') ? this.assets.get(cur.fallbackFont.slice(6))?.name : plan.substituteFont}`;
+        status.textContent = `⚠ ${[...new Set(plan.missing)].join(' ')} isn't in the document's embedded fonts → only ${plan.missing.length > 1 ? 'these characters are' : 'this character is'} drawn with ${cur.fallbackFont?.startsWith('asset:') ? this.assets.get(cur.fallbackFont.slice(6))?.name : prettyFont(plan.substituteFont ?? '')}; everything else stays untouched`;
       } else {
         status.className = 'editor-status ok';
-        status.textContent = `✓ Original font kept: ${font.displayName}${font.isSubset ? ' (subset)' : ''} · Enter to apply · Esc to cancel`;
+        status.textContent = `✓ Original fonts kept (${font.displayName}${plan.borrowed.length ? ' + glyphs from its other subsets' : ''}) · only changed characters are rewritten · Enter to apply · Esc to cancel`;
       }
     };
     updateStatus();
@@ -1307,10 +1312,10 @@ export class App {
     const e = this.state.textEdits[key]?.[gid] ?? {};
     const run = g.runs[0];
     const font = run.font;
-    const plan = planTextEdit(g, e);
+    const plan = planTextEdit(g, e, this.fontPool(key));
     const status =
       plan.mode === 'delete' ? h('span', { class: 'pill warn' }, 'Deleted')
-      : plan.mode === 'substitute' ? h('span', { class: 'pill warn' }, `Substitute font · missing ${[...new Set(plan.missing)].join('') || '(forced)'}`)
+      : plan.mode === 'substitute' ? h('span', { class: 'pill warn', style: 'white-space:normal' }, plan.missing.length ? `Fallback only for: ${[...new Set(plan.missing)].join(' ')} (rest untouched)` : 'Fallback font forced')
       : e.text !== undefined || plan.mode === 'reemit-original' ? h('span', { class: 'pill ok' }, '✓ Edited in original font')
       : h('span', { class: 'pill info' }, 'Original');
     const view = this.views.find((v) => v.slot.key === key);
@@ -1529,7 +1534,7 @@ export class App {
         const e = ((s.textEdits[m.key] ??= {})[m.g.id] ??= {});
         const next = (e.text ?? m.g.text).replace(re, () => { n++; return this.replaceText; });
         e.text = next;
-        if (planTextEdit(m.g, e).mode === 'substitute') subs++;
+        if (planTextEdit(m.g, e, this.fontPool(m.key)).mode === 'substitute') subs++;
       }
     });
     toast(`Replaced ${n} occurrence${n === 1 ? '' : 's'}${subs ? ` · ${subs} line(s) needed a fallback font` : ''}`, false, 4000);
@@ -1828,6 +1833,10 @@ export function fillToRgb(c: FillColor): RGB {
   if (v.length === 3) return [v[0], v[1], v[2]];
   if (v.length === 4) return [(1 - v[0]) * (1 - v[3]), (1 - v[1]) * (1 - v[3]), (1 - v[2]) * (1 - v[3])];
   return [0, 0, 0];
+}
+
+function prettyFont(n: string) {
+  return n.split(', ').map((x) => x.replace(/^bundled:/, '').replace(/^DejaVu/, 'DejaVu ')).join(', ');
 }
 
 function cssFontFamily(name: string, serif: boolean): string {

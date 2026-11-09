@@ -6,7 +6,7 @@ A PDF editor that runs entirely in the browser. It edits the real text inside a 
 npm install
 npm run dev        # develop at http://localhost:5173
 npm run release    # → release/deep-pdf-editor.html (single file, works offline, double-click to open)
-npm test           # engine round-trip, stress and quality tests (Node 22+; pixel checks use poppler if installed)
+npm test           # engine round-trip, stress, quality and symbol tests (Node 22+; pixel checks use poppler if installed)
 ```
 
 ## What it does
@@ -17,6 +17,7 @@ npm test           # engine round-trip, stress and quality tests (Node 22+; pixe
 | **Lossless export** | The default export is an **incremental update**. Every byte of the original file is kept verbatim and only your changes are appended (PDF 1.5 xref streams supported). Images, fonts and ICC profiles stay bit-identical. A "rebuilt & compact" export is also available. |
 | **Smart scan** | Every page is analysed in the background: text lines, fonts, images, watermarks, scanned (image-only) pages, and hidden OCR text layers. |
 | **Watermark studio** | Detects tagged watermark artifacts, Adobe Acrobat watermarks, `/Watermark` annotations, and untagged look-alikes (diagonal, translucent, repeated, "CONFIDENTIAL"/"DRAFT"…). For each one you can **re-text it in place in its own font**, change its opacity, colour, size or angle across every page, remove it, or replace it. You can also add text or image watermarks (centred, tiled or in corners, over or behind content, on page ranges like `1-3, odd`). Added watermarks are tagged as standard PDF watermark artifacts, so they stay editable after the file is re-opened. |
+| **Symbol-safe, minimal-change editing** | Edits are diffed glyph by glyph: every character you didn't change (₦ $ € £ ¥ © ® ™, ligatures, glyphs with no Unicode mapping) keeps its **exact original bytes, font, colour and position**. New characters are drawn first from the run's own font, then from other subsets of the same typeface anywhere in the document. Only a character that exists in none of them falls back to a style-matched font, and only that one character does. A bundled DejaVu subset covers currency and symbols such as ₦ ₵ ₹ that standard PDF fonts can't draw. Embedded font programs (TrueType, CFF, Type 1) are read to check which glyphs really exist, and to decode symbols in fonts without a ToUnicode map. A line can mix fonts, weights and colours; each run keeps its own. |
 | **Edit existing text** | Click any line to retype it. The new text is re-encoded into the PDF's content stream using the **original embedded font** (Type1, TrueType, CID/Type0, Type3, CJK). The rest of the line reflows. You can also move, resize, recolour or delete lines. |
 | **Find & replace** | Searches the whole document and writes replacements back into the original text runs. |
 | **Images & objects** | Move, delete or replace embedded images and vector form objects. |
@@ -37,8 +38,9 @@ npm test           # engine round-trip, stress and quality tests (Node 22+; pixe
    * **Restyle/move/rotate/opacity**: the original run is hidden (its advance is preserved). It is then redrawn **at the same place in the stream**: `ET q … BT … ET Q BT` with the text matrix restored afterwards. It uses the same font resource and inherits the colour and graphics state; only the property you changed is set.
    * **Missing glyph**: subset fonts only contain the characters the document already used. When you type a character that isn't there, that line falls back to a matching standard font, a font file you upload, or (in Chromium) **the same font installed on your computer** via *Match installed font*. The UI always tells you when this happens.
    * Page assembly, overlays, forms and metadata are done with pdf-lib.
-5. **`watermarks.ts`**: the document-wide smart scan and watermark detector (marked-content `/Artifact /Watermark` blocks, Acrobat `PieceInfo` watermark forms, watermark annotations, and heuristics: rotation, opacity from `ExtGState`, size, colour, wording, centring, repetition across pages).
-6. **Incremental writer** (`saveIncremental`): diffs every object against the pristine file and appends only the changed or new ones with a cross-reference table or stream that chains to the original (`/Prev`).
+5. **`textedit.ts`** + **`fontprog.ts`**: the glyph-level line diff, the per-character font chain, and the embedded-font-program reader (TrueType `cmap`/`loca`/`post`, CFF charsets, Type 1 eexec CharStrings).
+6. **`watermarks.ts`**: the document-wide smart scan and watermark detector (marked-content `/Artifact /Watermark` blocks, Acrobat `PieceInfo` watermark forms, watermark annotations, and heuristics: rotation, opacity from `ExtGState`, size, colour, wording, centring, repetition across pages).
+7. **Incremental writer** (`saveIncremental`): diffs every object against the pristine file and appends only the changed or new ones with a cross-reference table or stream that chains to the original (`/Prev`).
 
 Each preview is built by the same code path as the export, so what you see is what you download.
 

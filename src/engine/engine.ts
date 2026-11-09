@@ -28,7 +28,8 @@ import {
 } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings } from '@pdf-lib/standard-fonts';
-import { FontCache, standardFontFor, encodeMulti, type MultiEncode, type PdfFont } from './fonts.ts';
+import { FontCache, type PdfFont } from './fonts.ts';
+import { planLine, type FontSlot, type Piece } from './textedit.ts';
 import { interpretPage, mul, apply, invert, IDENTITY, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
 import { fmtNum, hexString, latin1, nameToken, type Operand } from './lexer.ts';
 import type { Asset, EditorState, Overlay, RGB, TextEdit, Watermark } from './model.ts';
@@ -84,31 +85,30 @@ export const STANDARD_FONT_NAMES = Object.values(StandardFonts) as string[];
 // Encoding analysis used by the UI
 // ---------------------------------------------------------------------------
 export interface EditPlan {
+  /** inplace: only changed glyphs rewritten; reemit-original: restyled in the original fonts;
+   *  substitute: some characters had to come from a fallback font (only those characters) */
   mode: 'inplace' | 'reemit-original' | 'substitute' | 'delete';
+  /** characters drawn with a fallback font */
   missing: string[];
   substituteFont?: string;
+  /** characters borrowed from another subset of the same typeface in the document */
+  borrowed: string[];
 }
 
-export function planTextEdit(group: TextGroup, edit: TextEdit): EditPlan {
-  if (edit.deleted) return { mode: 'delete', missing: [] };
-  const base = group.runs[0];
-  const text = edit.text ?? group.text;
-  const enc = encodeGroup(group, text);
-  const restyle = !!(edit.dx || edit.dy || (edit.scale && edit.scale !== 1) || edit.color);
-  if (!enc.ok || edit.forceFallback)
-    return { mode: 'substitute', missing: enc.missing, substituteFont: edit.fallbackFont ?? standardFontFor(base.font.baseFont, base.font) };
-  return { mode: restyle ? 'reemit-original' : 'inplace', missing: [] };
+export function planTextEdit(group: TextGroup, edit: TextEdit, pool: PdfFont[] = []): EditPlan {
+  if (edit.deleted) return { mode: 'delete', missing: [], borrowed: [] };
+  const lp = planLine(group, edit, pool);
+  if (lp.fallbackChars.length || edit.forceFallback)
+    return { mode: 'substitute', missing: lp.fallbackChars, substituteFont: lp.fallbackFonts.join(', '), borrowed: lp.borrowedChars };
+  return { mode: lp.restyle ? 'reemit-original' : 'inplace', missing: [], borrowed: lp.borrowedChars };
 }
 
-/** Distinct fonts of a group (base first) with the resource key that selects each. */
-export function groupFonts(group: TextGroup): { font: PdfFont; key: string }[] {
-  const out: { font: PdfFont; key: string }[] = [];
-  for (const r of group.runs) if (!out.some((f) => f.font === r.font)) out.push({ font: r.font, key: r.fontKey });
-  return out;
-}
-
-export function encodeGroup(group: TextGroup, text: string): MultiEncode {
-  return encodeMulti(groupFonts(group).map((f) => f.font), text);
+// ---------------------------------------------------------------------------
+// Bundled fallback fonts (registered by the host: UI bundle or tests)
+// ---------------------------------------------------------------------------
+const bundled = new Map<string, Uint8Array>();
+export function registerBundledFont(name: string, bytes: Uint8Array) {
+  bundled.set(name, bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,40 +141,6 @@ function kernFor(run: TextRun, adv: number): number {
 function hideRun(run: TextRun): string {
   const k = kernFor(run, run.advance);
   return opPrefix(run) + (Math.abs(k) > 1e-6 ? `[${fmtNum(k)}] TJ` : '[] TJ');
-}
-
-function encodedAdvance(run: TextRun, e: MultiEncode): number {
-  let adv = 0;
-  for (const sg of e.segs)
-    for (const g of sg.glyphs) {
-      if (g.code < 0) adv += (g.width / 1000) * run.fs * run.Th;
-      else adv += ((g.width / 1000) * run.fs + run.Tc + (g.isSpace ? run.Tw : 0)) * run.Th;
-    }
-  return adv;
-}
-
-/** Show operators for encoded segments, switching fonts as needed. Starts in font `startFi` (-1: none set). */
-function showSegments(group: TextGroup, e: MultiEncode, fs: number, startFi: number, lead = 0, tail = 0): string {
-  const fonts = groupFonts(group);
-  let cur = startFi;
-  let s = '';
-  if (Math.abs(lead) > 1e-4) {
-    if (cur < 0) { s += `${nameToken(fonts[0].key)} ${fmtNum(fs)} Tf `; cur = 0; }
-    s += `[${fmtNum(lead)}] TJ `;
-  }
-  for (const sg of e.segs) {
-    if (sg.fi !== cur) {
-      s += `${nameToken(fonts[sg.fi].key)} ${fmtNum(fs)} Tf `;
-      cur = sg.fi;
-    }
-    s += tjOperand(sg.items) + ' TJ ';
-  }
-  if (Math.abs(tail) > 1e-4) {
-    if (cur < 0) { s += `${nameToken(fonts[0].key)} ${fmtNum(fs)} Tf `; cur = 0; }
-    s += `[${fmtNum(tail)}] TJ `;
-  }
-  if (startFi >= 0 && cur !== startFi) s += `${nameToken(fonts[startFi].key)} ${fmtNum(fs)} Tf `;
-  return s.trim() || '[] TJ';
 }
 
 function colorOps(c: FillColor): string {
@@ -247,9 +213,21 @@ interface BuildCtx {
   customFonts: Map<string, LibFont>;
   assets: Map<string, Asset>;
   images: Map<string, { ref: PDFRef; w: number; h: number }>;
+  /** fonts of the source document (glyphs can be borrowed from same-face subsets) */
+  pool: PdfFont[];
 }
 
 async function getLibFont(bc: BuildCtx, name: string): Promise<LibFont> {
+  if (name.startsWith('bundled:')) {
+    let f = bc.customFonts.get(name);
+    if (!f) {
+      const bytes = bundled.get(name.slice(8));
+      if (!bytes) return getLibFont(bc, /Serif/.test(name) ? (/Bold/.test(name) ? StandardFonts.TimesRomanBold : StandardFonts.TimesRoman) : /Bold/.test(name) ? StandardFonts.HelveticaBold : StandardFonts.Helvetica);
+      f = await bc.doc.embedFont(bytes, { subset: true });
+      bc.customFonts.set(name, f);
+    }
+    return f;
+  }
   if (name.startsWith('asset:')) {
     const id = name.slice(6);
     let f = bc.customFonts.get(id);
@@ -407,141 +385,196 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
     }
   }
 
-  // ---- pass 1: resolve every edit, measure it, and compute inline reflow shifts
-  interface Resolved { group: TextGroup; edit: TextEdit; plan: EditPlan; text: string; encoded: MultiEncode; lf?: LibFont }
-  const resolved: Resolved[] = [];
+  // ---- text edits: glyph-level diff, only changed glyphs are rewritten
+  const textSpaceShift = (r: TextRun, sh: [number, number]) => {
+    const lin = mul(r.tm, r.ctm);
+    const inv = invert([lin[0], lin[1], lin[2], lin[3], 0, 0]);
+    return apply(inv, sh[0], sh[1])[0];
+  };
+  const unitDir = (r: TextRun): [number, number] => {
+    const m = mul(r.tm, r.ctm);
+    const l = Math.hypot(m[0], m[1]) || 1;
+    return [m[0] / l, m[1] / l];
+  };
+  const borrowKeys = new Map<PdfFont, string>();
+  const libKeys = new Map<string, { key: string; font: LibFont }>();
+  const slotKey = async (slot: FontSlot): Promise<string> => {
+    if (slot.kind === 'orig') return slot.key;
+    if (slot.kind === 'borrow') {
+      let k = borrowKeys.get(slot.font);
+      if (!k) borrowKeys.set(slot.font, (k = page.node.newFontDictionary('EdB', slot.font.ref!).decodeText()));
+      return k;
+    }
+    let e = libKeys.get(slot.name);
+    if (!e) {
+      const font = await getLibFont(bc, slot.name);
+      e = { key: page.node.newFontDictionary('EdF', font.ref).decodeText(), font };
+      libKeys.set(slot.name, e);
+    }
+    return e.key;
+  };
+  /** text-space advance of a run's new pieces (using the run's own Tc/Tw/Tz) */
+  const piecesAdvance = async (run: TextRun, pieces: Piece[]) => {
+    let adv = 0;
+    for (const pc of pieces) {
+      if (pc.slot.kind === 'lib') {
+        await slotKey(pc.slot);
+        const lf = libKeys.get(pc.slot.name)!.font;
+        const txt = libClean(lf, pc.text);
+        const singleByte = STANDARD_FONT_NAMES.includes(pc.slot.name);
+        adv += (lf.widthOfTextAtSize(txt, run.fs) + Array.from(txt).length * run.Tc + (singleByte ? (txt.match(/ /g)?.length ?? 0) * run.Tw : 0)) * run.Th;
+        continue;
+      }
+      let gi = 0;
+      for (const it of pc.items) {
+        if (typeof it === 'number') adv += (-it / 1000) * run.fs * run.Th;
+        else {
+          const f = (pc.slot as { font: PdfFont }).font;
+          // count glyphs in this string using the font's own code length
+          for (const g of f.decode(it)) {
+            void g;
+            const gl = pc.glyphs[gi++];
+            adv += (((gl?.width ?? 0) / 1000) * run.fs + run.Tc + (gl?.isSpace ? run.Tw : 0)) * run.Th;
+          }
+        }
+      }
+    }
+    return adv;
+  };
+  /** operators that show the pieces, starting and ending in the run's own font */
+  const piecesOps = async (run: TextRun, pieces: Piece[], lead: number, tail: number) => {
+    let s = '';
+    let cur = run.fontKey;
+    if (Math.abs(lead) > 1e-6) s += `[${fmtNum(lead)}] TJ `;
+    for (const pc of pieces) {
+      const k = await slotKey(pc.slot);
+      if (k !== cur) {
+        s += `${nameToken(k)} ${fmtNum(run.fs)} Tf `;
+        cur = k;
+      }
+      if (pc.slot.kind === 'lib') s += `${libEncode(libKeys.get(pc.slot.name)!.font, pc.text)} Tj `;
+      else if (pc.items.length) s += tjOperand(pc.items) + ' TJ ';
+    }
+    if (Math.abs(tail) > 1e-6) s += `[${fmtNum(tail)}] TJ `;
+    if (cur !== run.fontKey) s += `${nameToken(run.fontKey)} ${fmtNum(run.fs)} Tf `;
+    return s.trim() || '[] TJ';
+  };
+
   const shifts = new Map<string, [number, number]>();
-  const groupOfRun = new Map<string, TextGroup>();
-  for (const g of model.groups) for (const r of g.runs) groupOfRun.set(r.id, g);
+  const pool = bc.pool;
   for (const gid in tEdits) {
     const edit = tEdits[gid];
     const group = model.groups.find((g) => g.id === gid);
     if (!group) continue;
-    const base = group.runs[0];
-    const plan = planTextEdit(group, edit);
-    const text = edit.text ?? group.text;
-    const encoded = encodeGroup(group, text);
-    const lf = plan.mode === 'substitute' ? await getLibFont(bc, plan.substituteFont ?? StandardFonts.Helvetica) : undefined;
-    resolved.push({ group, edit, plan, text, encoded, lf });
-    const restyle = !!(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1));
-    if (edit.noReflow || restyle) continue;
-    let newAdv: number;
-    if (plan.mode === 'delete') newAdv = 0;
-    else if (plan.mode === 'substitute') newAdv = lf!.widthOfTextAtSize(libClean(lf!, text), base.fs) * base.Th;
-    else newAdv = encodedAdvance(base, encoded);
-    const m = mul(base.tm, base.ctm);
-    const inv = invert(m);
-    const fs = Math.abs(base.fs) || 1;
-    let endX = 0;
-    for (const r of group.runs) {
-      const rm = mul(r.tm, r.ctm);
-      endX = Math.max(endX, apply(inv, ...apply(rm, r.advance, 0))[0]);
-    }
-    const delta = newAdv - endX;
-    if (Math.abs(delta) < 0.01 * fs) continue;
-    // chain of runs that continue this line (stop at the first column-sized gap)
-    const cands = model.runs
-      .filter((r) => !group.runs.includes(r) && r.glyphs.length)
-      .map((r) => {
-        const rm = mul(r.tm, r.ctm);
-        const p0 = apply(inv, rm[4], rm[5]);
-        const p1 = apply(inv, ...apply(rm, r.advance, 0));
-        return { r, x0: Math.min(p0[0], p1[0]), x1: Math.max(p0[0], p1[0]), y: p0[1], par: Math.abs(rm[1] * m[0] - rm[0] * m[1]) < 1e-3 * (Math.abs(rm[0] * m[0]) + 1e-9) * 50 };
-      })
-      .filter((c) => c.par && Math.abs(c.y) < 0.25 * fs && c.x0 > endX - 0.1 * fs)
-      .sort((a, b) => a.x0 - b.x0);
-    let cur = endX;
-    const [ux, uy] = [m[0] * delta, m[1] * delta];
-    for (const c of cands) {
-      if (c.x0 - cur > 1.2 * fs) break;
-      cur = Math.max(cur, c.x1);
-      // a whole edited group moves together, keyed by run
-      const prev = shifts.get(c.r.id) ?? [0, 0];
-      shifts.set(c.r.id, [prev[0] + ux, prev[1] + uy]);
-    }
-  }
-  const textSpaceShift = (r: TextRun, s: [number, number]) => {
-    const lin = mul(r.tm, r.ctm);
-    const inv = invert([lin[0], lin[1], lin[2], lin[3], 0, 0]);
-    return apply(inv, s[0], s[1])[0];
-  };
-
-  // ---- pass 2: write patches
-  for (const { group, edit, plan, text, encoded, lf } of resolved) {
-    const base = group.runs[0];
-    if (plan.mode === 'delete') {
+    if (edit.deleted) {
       for (const r of group.runs) patch(r, hideRun(r));
       continue;
     }
-    const sh = shifts.get(base.id);
-    if (plan.mode === 'inplace') {
-      const adv = encodedAdvance(base, encoded);
-      const lead = sh ? kernFor(base, textSpaceShift(base, sh)) : 0;
-      const comp = kernFor(base, base.advance - adv) - lead;
-      patch(base, opPrefix(base) + showSegments(group, encoded, base.fs, 0, lead, comp));
-      for (const r of group.runs.slice(1)) patch(r, hideRun(r));
+    const lp = planLine(group, edit, pool);
+    const base = group.runs[0];
+    const reflow = !edit.noReflow && !(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1));
+
+    if (!lp.restyle) {
+      // in place: changed runs are rewritten inside their own operator (own font, colour and state);
+      // their end point is restored so nothing else moves implicitly, and following runs slide explicitly
+      let S: [number, number] = [0, 0];
+      for (const rp of lp.runs) {
+        const run = rp.run;
+        const lead = reflow && (S[0] || S[1]) ? kernFor(run, textSpaceShift(run, S)) : 0;
+        if (rp.changed) {
+          const newAdv = await piecesAdvance(run, rp.pieces);
+          const leadDisp = (-lead / 1000) * run.fs * run.Th;
+          const tail = kernFor(run, run.advance - newAdv - leadDisp);
+          patch(run, opPrefix(run) + (await piecesOps(run, rp.pieces, lead, tail)));
+          if (reflow) {
+            const [dx, dy] = unitDir(run);
+            const lin = mul(run.tm, run.ctm);
+            const scale = Math.hypot(lin[0], lin[1]);
+            const d = (newAdv - run.advance) * scale - rp.gapRemoved;
+            S = [S[0] + dx * d, S[1] + dy * d];
+          }
+        } else if (Math.abs(lead) > 1e-6) {
+          patch(run, opPrefix(run) + tjOperand([lead, ...run.items, -lead]) + ' TJ');
+        }
+      }
+      // the rest of the visual line (other groups/columns stay put)
+      if (reflow && Math.hypot(S[0], S[1]) > 0.01) {
+        const m = mul(base.tm, base.ctm);
+        const inv = invert(m);
+        const fs = Math.abs(base.fs) || 1;
+        let endX = 0;
+        for (const r of group.runs) endX = Math.max(endX, apply(inv, ...apply(mul(r.tm, r.ctm), r.advance, 0))[0]);
+        const cands = model.runs
+          .filter((r) => !group.runs.includes(r) && r.glyphs.length)
+          .map((r) => {
+            const rm = mul(r.tm, r.ctm);
+            const p0 = apply(inv, rm[4], rm[5]);
+            const p1 = apply(inv, ...apply(rm, r.advance, 0));
+            return { r, x0: Math.min(p0[0], p1[0]), x1: Math.max(p0[0], p1[0]), y: p0[1], par: Math.abs(Math.atan2(rm[1], rm[0]) - Math.atan2(m[1], m[0])) < 0.02 };
+          })
+          .filter((c) => c.par && Math.abs(c.y) < 0.25 * fs && c.x0 > endX - 0.1 * fs)
+          .sort((a, b) => a.x0 - b.x0);
+        let cur = endX;
+        for (const c of cands) {
+          if (c.x0 - cur > 1.2 * fs) break;
+          cur = Math.max(cur, c.x1);
+          const prev = shifts.get(c.r.id) ?? [0, 0];
+          shifts.set(c.r.id, [prev[0] + S[0], prev[1] + S[1]]);
+        }
+      }
       continue;
     }
-    // redraw (moved / restyled / substitute font)
-    for (const r of group.runs) patch(r, hideRun(r));
-    const scale = edit.scale ?? 1;
-    const fs = base.fs * scale;
-    const dx = (edit.dx ?? 0) + (sh?.[0] ?? 0);
-    const dy = (edit.dy ?? 0) + (sh?.[1] ?? 0);
-    let show: string;
-    if (plan.mode === 'reemit-original') show = showSegments(group, encoded, fs, scale === 1 ? 0 : -1);
-    else {
-      const fk = page.node.newFontDictionary('EdF', lf!.ref).decodeText();
-      show = `${nameToken(fk)} ${fmtNum(fs)} Tf ${libEncode(lf!, text)} Tj`;
-    }
-    // user-space transform (move + rotate about the start of the baseline)
-    let userM: Matrix = [1, 0, 0, 1, dx, dy];
-    if (edit.rotate) {
-      const [px, py] = apply(mul(base.tm, base.ctm), 0, 0);
-      const a = (edit.rotate * Math.PI) / 180;
-      userM = mul(mul(mul([1, 0, 0, 1, -px, -py], [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), 0, 0]), [1, 0, 0, 1, px, py]), userM);
-    }
-    const ident = Math.abs(userM[0] - 1) + Math.abs(userM[1]) + Math.abs(userM[2]) + Math.abs(userM[3] - 1) + Math.abs(userM[4]) + Math.abs(userM[5]) < 1e-9;
-    const stroked = [1, 2, 5, 6].includes(base.Tr);
-    let state = '';
-    if (scale !== 1) state += `${fmtNum(base.Tc * scale)} Tc ${fmtNum(base.Tw * scale)} Tw ${fmtNum(base.Ts * scale)} Ts `;
-    if (edit.color) state += rgbOps(edit.color) + ' ' + (stroked ? rgbOps(edit.color, true) + ' ' : '');
-    const gsOp = edit.opacity !== undefined ? `${nameToken(alphaGs(edit.opacity))} gs ` : '';
 
-    if (base.Tr < 4) {
-      // In-stream redraw: the text is painted at its original position in the content stream, inside the
-      // original graphics state – colour space, shade, transparency, blend mode, clipping and stacking
-      // order are inherited untouched. Only what you changed is set explicitly.
-      const local = ident ? '' : `${mat(mul(mul(base.ctm, userM), invert(base.ctm)))} cm `;
-      const tmAfter = mul([1, 0, 0, 1, base.advance, 0], base.tm);
-      const R = mul(tmAfter, invert(base.tlm));
-      let restore: string;
-      if (Math.abs(R[0] - 1) + Math.abs(R[1]) + Math.abs(R[2]) + Math.abs(R[3] - 1) + Math.abs(R[5]) < 1e-6) {
-        const k = kernFor(base, R[4]);
-        restore = `${mat(base.tlm)} Tm` + (Math.abs(k) > 1e-6 ? ` [${fmtNum(k)}] TJ` : '');
-      } else restore = `${mat(tmAfter)} Tm`;
-      const prev = patches.get(base.stream)!.find((p) => p.start === base.start)!;
-      prev.text += ` ET q ${gsOp}${local}BT ${mat(base.tm)} Tm ${state}${show} ET Q BT ${restore}`;
-    } else {
-      // clipping text modes: drawing order matters for the clip, so draw separately after the page
-      const color = edit.color ? rgbOps(edit.color) : colorOps(base.color);
-      const shift = ident ? '' : `${mat(userM)} cm `;
-      append +=
-        `q ${gsOp}${shift}${mat(base.ctm)} cm BT ${nameToken(base.fontKey)} ${fmtNum(fs)} Tf ${fmtNum(base.Th * 100)} Tz ${fmtNum(base.Ts * scale)} Ts ${fmtNum(base.Tr)} Tr ${color} ` +
-        `${mat(base.tm)} Tm ${show} ET Q\n`;
+    // restyled (moved / scaled / rotated / recoloured / opacity / forced fallback):
+    // every run is hidden and redrawn at its own spot in the stream, inheriting its own state
+    let userM: Matrix = [1, 0, 0, 1, edit.dx ?? 0, edit.dy ?? 0];
+    const [px, py] = apply(mul(base.tm, base.ctm), 0, 0);
+    const sc = edit.scale ?? 1;
+    const a = ((edit.rotate ?? 0) * Math.PI) / 180;
+    if (sc !== 1 || a) userM = mul(mul(mul([1, 0, 0, 1, -px, -py], [sc * Math.cos(a), sc * Math.sin(a), -sc * Math.sin(a), sc * Math.cos(a), 0, 0]), [1, 0, 0, 1, px, py]), userM);
+    const ident = Math.abs(userM[0] - 1) + Math.abs(userM[1]) + Math.abs(userM[2]) + Math.abs(userM[3] - 1) + Math.abs(userM[4]) + Math.abs(userM[5]) < 1e-9;
+    const gsOp = edit.opacity !== undefined ? `${nameToken(alphaGs(edit.opacity))} gs ` : '';
+    let S: [number, number] = [0, 0];
+    for (const rp of lp.runs) {
+      const run = rp.run;
+      const lead = S[0] || S[1] ? kernFor(run, textSpaceShift(run, S)) : 0;
+      const newAdv = await piecesAdvance(run, rp.pieces);
+      {
+        const [dx, dy] = unitDir(run);
+        const lin = mul(run.tm, run.ctm);
+        const d = (newAdv - run.advance) * Math.hypot(lin[0], lin[1]) - rp.gapRemoved;
+        S = [S[0] + dx * d, S[1] + dy * d];
+      }
+      const show = await piecesOps(run, rp.pieces, lead, 0);
+      const stroked = [1, 2, 5, 6].includes(run.Tr);
+      const state = edit.color ? rgbOps(edit.color) + ' ' + (stroked ? rgbOps(edit.color, true) + ' ' : '') : '';
+      patch(run, hideRun(run));
+      if (run.Tr < 4) {
+        const local = ident ? '' : `${mat(mul(mul(run.ctm, userM), invert(run.ctm)))} cm `;
+        const tmAfter = mul([1, 0, 0, 1, run.advance, 0], run.tm);
+        const R = mul(tmAfter, invert(run.tlm));
+        let restore: string;
+        if (Math.abs(R[0] - 1) + Math.abs(R[1]) + Math.abs(R[2]) + Math.abs(R[3] - 1) + Math.abs(R[5]) < 1e-6) {
+          const k = kernFor(run, R[4]);
+          restore = `${mat(run.tlm)} Tm` + (Math.abs(k) > 1e-6 ? ` [${fmtNum(k)}] TJ` : '');
+        } else restore = `${mat(tmAfter)} Tm`;
+        const prev = patches.get(run.stream)!.find((p) => p.start === run.start)!;
+        prev.text += ` ET q ${gsOp}${local}BT ${mat(run.tm)} Tm ${state}${show} ET Q BT ${restore}`;
+      } else {
+        // clipping text modes: draw separately after the page content
+        const color = edit.color ? rgbOps(edit.color) : colorOps(run.color);
+        append += `q ${gsOp}${ident ? '' : mat(userM) + ' cm '}${mat(run.ctm)} cm BT ${nameToken(run.fontKey)} ${fmtNum(run.fs)} Tf ${fmtNum(run.Tc)} Tc ${fmtNum(run.Tw)} Tw ${fmtNum(run.Th * 100)} Tz ${fmtNum(run.Ts)} Ts ${fmtNum(run.Tr)} Tr ${color} ${mat(run.tm)} Tm ${show} ET Q\n`;
+      }
     }
   }
 
   // untouched runs that must slide along their line
   for (const [rid, sh] of shifts) {
     if (patched.has(rid)) continue;
-    const g = groupOfRun.get(rid);
-    const run = g?.runs.find((r) => r.id === rid) ?? model.runs.find((r) => r.id === rid);
+    const run = model.runs.find((r) => r.id === rid);
     if (!run) continue;
     const k = kernFor(run, textSpaceShift(run, sh));
-    const op = model.streams[run.stream].ops[run.opIndex];
-    const items = runItems(run, op.operands);
-    patch(run, opPrefix(run) + tjOperand([k, ...items, -k]) + ' TJ');
+    patch(run, opPrefix(run) + tjOperand([k, ...run.items, -k]) + ' TJ');
   }
 
   for (const xid in xEdits) {
@@ -926,7 +959,7 @@ export async function buildPdf(
   const ctxFor = new Map<PDFDocument, BuildCtx>();
   const bcOf = (doc: PDFDocument): BuildCtx => {
     let bc = ctxFor.get(doc);
-    if (!bc) ctxFor.set(doc, (bc = { doc, stdFonts: new Map(), customFonts: new Map(), assets, images: new Map() }));
+    if (!bc) ctxFor.set(doc, (bc = { doc, stdFonts: new Map(), customFonts: new Map(), assets, images: new Map(), pool: [...sources.values()].find((x) => fresh.get(x.info.id) === doc)?.fonts.all() ?? [] }));
     return bc;
   };
 

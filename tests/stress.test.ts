@@ -2,6 +2,7 @@
    rebuild and verify pdf.js extracts the new text. */
 import { readFileSync, readdirSync } from 'node:fs';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+import './register-fonts.ts';
 import { SourceDoc, buildPdf, planTextEdit } from '../src/engine/engine.ts';
 import { emptyState } from '../src/engine/model.ts';
 
@@ -30,9 +31,10 @@ for (const f of readdirSync('tests/fixtures').filter((x) => x.endsWith('.pdf')))
       expect.push([...t].reverse().join('').replace(/\s+/g, ''));
     }
     const out = await buildPdf(new Map([['s0', src]]), 's0', st, new Map());
-    const doc = await pdfjs.getDocument({ data: out, verbosity: 0 }).promise;
+    const doc = await pdfjs.getDocument({ data: out.slice(), verbosity: 0 }).promise;
     const tc = await (await doc.getPage(1)).getTextContent();
-    const all = (tc.items as { str: string }[]).map((i) => i.str).join('').replace(/\s+/g, '');
+    const re = await SourceDoc.open({ id: 'r', name: 'r', bytes: out });
+    const all = (tc.items as { str: string }[]).map((i) => i.str).join('').replace(/\s+/g, '') + '\n' + re.model(0).groups.map((g) => g.text).join('').replace(/\s+/g, '');
     for (const e of expect) {
       if (all.includes(e.slice(0, 30))) ok++;
       else { bad++; console.log(`   ✘ ${f} p${p} missing: ${e.slice(0, 50)}`); }

@@ -6,6 +6,7 @@
 import { PDFArray, PDFDict, PDFName, PDFNumber, PDFRef, type PDFContext, type PDFObject } from 'pdf-lib';
 import { Encodings, Font as StdFont, type IFontNames } from '@pdf-lib/standard-fonts';
 import { parseCMap, type CodespaceRange } from './cmap.ts';
+import { parseFontProgram, type FontProgram } from './fontprog.ts';
 import { arrNums, dictGet, getArray, getDict, getName, getNum, resolve, streamBytes } from './pdfobj.ts';
 
 export interface Glyph {
@@ -90,7 +91,7 @@ function decoderTable(label: string): (string | undefined)[] {
   for (let i = 0; i < 256; i++) {
     if (i < 32) continue;
     const ch = dec ? dec.decode(Uint8Array.of(i)) : String.fromCharCode(i);
-    if (ch === '�') continue;
+    if (ch === '\ufffd') continue;
     out[i] = UNI_TO_GLYPH.get(ch) ?? (ch.length === 1 ? 'uni' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') : undefined);
   }
   return out;
@@ -149,30 +150,6 @@ function stdMetrics(name: IFontNames): StdFont {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal TrueType glyph presence check (loca/glyf) for CIDFontType2 subsets.
-// ---------------------------------------------------------------------------
-function ttfGlyphPresence(data: Uint8Array): ((gid: number) => boolean) | undefined {
-  try {
-    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const numTables = dv.getUint16(4);
-    const tables: Record<string, { off: number; len: number }> = {};
-    for (let i = 0; i < numTables; i++) {
-      const o = 12 + i * 16;
-      const tag = String.fromCharCode(data[o], data[o + 1], data[o + 2], data[o + 3]);
-      tables[tag] = { off: dv.getUint32(o + 8), len: dv.getUint32(o + 12) };
-    }
-    if (!tables.head || !tables.loca || !tables.maxp) return undefined;
-    const longFmt = dv.getInt16(tables.head.off + 50) === 1;
-    const numGlyphs = dv.getUint16(tables.maxp.off + 4);
-    const loca = tables.loca.off;
-    const off = (g: number) => (longFmt ? dv.getUint32(loca + g * 4) : dv.getUint16(loca + g * 2) * 2);
-    return (gid: number) => gid > 0 && gid < numGlyphs && off(gid + 1) > off(gid);
-  } catch {
-    return undefined;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // PdfFont
 // ---------------------------------------------------------------------------
 export class PdfFont {
@@ -193,6 +170,14 @@ export class PdfFont {
   hasToUnicode = false;
   /** codes actually used in content we interpreted */
   usedCodes = new Set<number>();
+  /** indirect reference of the font dictionary (lets other pages borrow its glyphs) */
+  ref?: PDFRef;
+  /** parsed embedded font program, when readable */
+  program?: FontProgram;
+  symbolic = false;
+  private codeNames: (string | undefined)[] = [];
+  private tuCodes = new Set<number>();
+  private gidToUni?: Map<number, string>;
 
   private codespace: CodespaceRange[] = [{ len: 1, lo: 0, hi: 255 }];
   private toUni = new Map<number, string>();
@@ -200,7 +185,6 @@ export class PdfFont {
   private codeLenHint = new Map<number, number>();
   private widths = new Map<number, number>(); // keyed by code (simple) or CID (type0)
   private defaultWidth = 0;
-  private glyphPresent?: (cid: number) => boolean;
   private cidToGid?: Uint16Array;
   private reverse?: Map<string, number>;
   private maxLig = 1;
@@ -222,8 +206,6 @@ export class PdfFont {
         const cidSub = getName(ctx, cid, 'Subtype');
         const ff2 = descriptor ? dictGet(ctx, descriptor, 'FontFile2') : undefined;
         if (cidSub === 'CIDFontType2' && ff2) {
-          const data = streamBytes(ctx, ff2);
-          if (data) this.glyphPresent = ttfGlyphPresence(data);
           const c2g = dictGet(ctx, cid, 'CIDToGIDMap');
           if (c2g && !(c2g instanceof PDFName)) {
             const m = streamBytes(ctx, c2g);
@@ -269,6 +251,16 @@ export class PdfFont {
       this.embedded = !!(dictGet(ctx, descriptor, 'FontFile') || dictGet(ctx, descriptor, 'FontFile2') || dictGet(ctx, descriptor, 'FontFile3'));
       if (!this.defaultWidth) this.defaultWidth = getNum(ctx, descriptor, 'MissingWidth') ?? 0;
     }
+    if (descriptor) {
+      this.symbolic = ((getNum(ctx, descriptor, 'Flags') ?? 0) & 4) !== 0;
+      for (const k of ['FontFile2', 'FontFile3', 'FontFile'] as const) {
+        const ff = dictGet(ctx, descriptor, k);
+        if (!ff) continue;
+        const data = streamBytes(ctx, ff);
+        if (data) this.program = parseFontProgram(data, k);
+        break;
+      }
+    }
     if (this.isType3) {
       this.embedded = true;
       this.ascent = 800;
@@ -286,7 +278,7 @@ export class PdfFont {
         const cm = parseCMap(data);
         if (cm.toUnicode.size) {
           this.hasToUnicode = true;
-          for (const [k, v] of cm.toUnicode) this.toUni.set(k, v);
+          for (const [k, v] of cm.toUnicode) { this.toUni.set(k, v); this.tuCodes.add(k); }
           for (const [k, v] of cm.codeLen) this.codeLenHint.set(k, v);
           if (this.isType0 && this.codespace.length === 1 && this.codespace[0].len === 2 && cm.codespace.length) {
             // honour ToUnicode codespace when the encoding is a predefined CMap we don't ship
@@ -355,6 +347,7 @@ export class PdfFont {
         else if (v instanceof PDFName) names[code++] = v.decodeText();
       }
     }
+    this.codeNames = names;
     const stdName = !ws && std ? std : undefined;
     const metrics = stdName ? stdMetrics(stdName) : undefined;
     for (let c = 0; c < 256; c++) {
@@ -408,29 +401,68 @@ export class PdfFont {
       i += len;
       this.usedCodes.add(code);
       let u = this.toUni.get(code);
+      if (u === undefined && this.isType0) u = this.uniFromProgram(code);
       if (u === undefined) {
         if (!this.isType0 && code >= 32 && code < 127 && !this.hasToUnicode) u = String.fromCharCode(code);
-        else u = '�';
+        else u = '\ufffd';
       }
       out.push({ code, bytes: raw, unicode: u, width: this.widthOfCode(code), isSpace: len === 1 && code === 32 });
     }
     return out;
   }
 
+  private gidOfCid(cid: number): number {
+    return this.cidToGid ? this.cidToGid[cid] ?? 0 : cid;
+  }
+
+  private uniFromProgram(code: number): string | undefined {
+    const P = this.program;
+    if (!P?.unicodeCmap) return undefined;
+    if (!this.gidToUni) {
+      this.gidToUni = new Map();
+      for (const [u, g] of P.unicodeCmap) if (!this.gidToUni.has(g)) this.gidToUni.set(g, String.fromCodePoint(u));
+    }
+    return this.gidToUni.get(this.gidOfCid(this.cidOf(code)));
+  }
+
+  /** Does the embedded font program really contain a glyph for this code? undefined = can't tell. */
+  private programHas(code: number): boolean | undefined {
+    const P = this.program;
+    if (!P) return undefined;
+    if (this.isType0) {
+      const cid = this.cidOf(code);
+      let gid: number | undefined;
+      if (P.cidToGid) gid = P.cidToGid.get(cid);
+      else gid = this.gidOfCid(cid);
+      if (gid === undefined) return false;
+      return P.hasGlyph(gid) || (gid > 0 && /^\s$/.test(this.toUni.get(code) ?? ''));
+    }
+    const name = this.codeNames[code];
+    if (P.kind === 'type1' || P.kind === 'cff') {
+      if (!name) return P.kind === 'cff' ? undefined : false;
+      const g = P.nameToGid?.get(name);
+      if (g === undefined) return false;
+      return P.hasGlyph(g) || /space/.test(name);
+    }
+    let gid: number | undefined;
+    if (P.codeCmap && (this.symbolic || !P.unicodeCmap)) gid = P.codeCmap.get(0xf000 + code) ?? P.codeCmap.get(code);
+    if (gid === undefined && P.unicodeCmap && name) {
+      const u = glyphNameToUnicode(name);
+      if (u) gid = P.unicodeCmap.get(u.codePointAt(0)!);
+    }
+    if (gid === undefined && name && P.nameToGid) gid = P.nameToGid.get(name);
+    if (gid === undefined && P.codeCmap) gid = P.codeCmap.get(code) ?? P.codeCmap.get(0xf000 + code);
+    if (!gid) return false;
+    return P.hasGlyph(gid) || name === 'space' || code === 32;
+  }
+
   private codeAvailable(code: number): boolean {
     if (this.usedCodes.has(code)) return true;
-    if (this.glyphPresent) {
-      const cid = this.cidOf(code);
-      const gid = this.cidToGid ? this.cidToGid[cid] ?? 0 : cid;
-      return this.glyphPresent(gid);
-    }
+    const p = this.programHas(code);
+    if (p !== undefined) return p;
     if (this.isType3) return false; // Type3 glyph procs: only what's used is safe
     if (!this.embedded) return true; // viewer-provided font has all glyphs
-    if (this.isSubset && !this.hasToUnicode) return false;
-    if (this.isSubset) {
-      // subset with ToUnicode: listed codes generally exist; require a width entry too
-      return this.widths.has(this.isType0 ? this.cidOf(code) : code);
-    }
+    if (this.isSubset) return this.tuCodes.has(code) && this.widths.has(this.isType0 ? this.cidOf(code) : code);
     return true;
   }
 
@@ -438,18 +470,34 @@ export class PdfFont {
     const rev = new Map<string, number>();
     // used codes first (most reliable), then everything else that maps
     const consider = (code: number, u: string) => {
-      if (!u || u === '�') return;
+      if (!u || u === '\ufffd') return;
       const nu = u.normalize('NFC');
       if (!rev.has(nu) && this.codeAvailable(code)) rev.set(nu, code);
       if (nu.length > this.maxLig) this.maxLig = Math.min(nu.length, 4);
     };
     for (const code of this.usedCodes) {
-      const u = this.toUni.get(code) ?? (!this.isType0 && code >= 32 && code < 127 ? String.fromCharCode(code) : undefined);
+      const u = this.toUni.get(code) ?? (this.isType0 ? this.uniFromProgram(code) : code >= 32 && code < 127 ? String.fromCharCode(code) : undefined);
       if (u) consider(code, u);
     }
     for (const [code, u] of this.toUni) consider(code, u);
     if (!this.isType0 && !this.hasToUnicode) {
       for (let c = 32; c < 127; c++) if (!this.toUni.has(c)) consider(c, String.fromCharCode(c));
+    }
+    // Identity-encoded TrueType: any glyph in the embedded program is reachable through its cmap
+    const P = this.program;
+    if (this.isType0 && !this.toCid && P?.unicodeCmap && this.codespace.length === 1 && this.codespace[0].len === 2) {
+      let inv: Map<number, number> | undefined;
+      if (this.cidToGid) {
+        inv = new Map();
+        this.cidToGid.forEach((g, cid) => { if (g && !inv!.has(g)) inv!.set(g, cid); });
+      }
+      for (const [u, gid] of P.unicodeCmap) {
+        const ch = String.fromCodePoint(u).normalize('NFC');
+        if (rev.has(ch)) continue;
+        const cid = inv ? inv.get(gid) : gid;
+        if (cid === undefined || cid > 0xffff) continue;
+        if (P.hasGlyph(gid) || /^\s$/.test(ch)) rev.set(ch, cid);
+      }
     }
     this.reverse = rev;
   }
@@ -566,8 +614,13 @@ export class FontCache {
       console.warn('font parse failed', e);
       return undefined;
     }
+    if (obj instanceof PDFRef) f.ref = obj;
     if (key) this.byRef.set(key, f);
     return f;
+  }
+  /** every font parsed so far in this document */
+  all(): PdfFont[] {
+    return [...this.byRef.values()];
   }
 }
 

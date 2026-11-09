@@ -64,3 +64,20 @@ console.log('form fixture ok');
   writeFileSync('tests/fixtures/watermarked.pdf', await d.save());
 }
 console.log('quality fixtures ok');
+
+// Type0 font with currency symbols and NO ToUnicode map (symbols must decode from the font program itself)
+{
+  const { PDFName } = await import('pdf-lib');
+  const d = await PDFDocument.create();
+  d.registerFontkit(fontkit);
+  const f = await d.embedFont(readFileSync('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'), { subset: false });
+  const p = d.addPage([612, 792]);
+  p.drawText('Amount ₦5,000 or $12 or €9', { x: 72, y: 700, size: 16, font: f });
+  await d.flush();
+  for (const [, obj] of d.context.enumerateIndirectObjects()) {
+    const dict = (obj as { get?: (n: unknown) => unknown; delete?: (n: unknown) => void });
+    if (dict.get && dict.delete && String(dict.get(PDFName.of('Subtype'))) === '/Type0') dict.delete(PDFName.of('ToUnicode'));
+  }
+  writeFileSync('tests/fixtures/notounicode.pdf', await d.save());
+}
+console.log('symbol fixtures ok');

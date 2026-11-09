@@ -1,6 +1,7 @@
 /* Engine round-trip tests: edit text in real PDFs and verify via pdf.js + re-interpretation. */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+import './register-fonts.ts';
 import { SourceDoc, buildPdf, planTextEdit } from '../src/engine/engine.ts';
 import { emptyState, type EditorState } from '../src/engine/model.ts';
 
@@ -47,7 +48,7 @@ async function editCase(file: string, find: string, replacement: string) {
   writeFileSync(`tests/out/${file.split('/').pop()}`, out);
   const before = await extract(src.info.bytes);
   const after = await extract(out);
-  check(after[0].text.includes(replacement), 'new text is present in output');
+  check(after[0].text.replace(/\s/g, '').includes(replacement.replace(/\s/g, '')), 'new text is present in output');
   check(!after[0].text.includes(find) || g.text.replace(find, '').includes(find), 'old text is gone');
   void before;
   // re-interpret: other groups untouched

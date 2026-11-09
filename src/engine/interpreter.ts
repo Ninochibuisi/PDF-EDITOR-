@@ -78,9 +78,39 @@ export interface TextRun {
   tlm: Matrix;
   /** id of the enclosing watermark artifact block, if any */
   wm?: string;
+  /** show operands as strings/numbers, in order */
+  items: (Uint8Array | number)[];
+  units: RunUnit[];
+  /** TJ numbers after the last unit */
+  trailing: number[];
   bt: number;
   quad: [number, number][];
   bbox: BBox;
+}
+
+/** One editable unit of a run: a glyph (original bytes) or a kerning gap that reads as a space. */
+export interface RunUnit {
+  kind: 'glyph' | 'kern';
+  text: string;
+  /** original code bytes (glyph) */
+  bytes: number[];
+  code: number;
+  /** advance width in 1/1000 em (glyph) */
+  width: number;
+  isSpace: boolean;
+  /** TJ numbers that precede this unit inside the run */
+  pre: number[];
+  /** the TJ number itself (kern units) */
+  tj: number;
+}
+
+export interface GroupUnit extends RunUnit {
+  /** index of the run in the group; for gaps: the run before the gap */
+  run: number;
+  /** inter-run gap rendered as a space in the line text (not part of any operator) */
+  gap?: boolean;
+  /** user-space length of a gap */
+  gapLen?: number;
 }
 
 export interface MarkedBlock {
@@ -141,6 +171,7 @@ export interface TextGroup {
   angle: number;
   /** font size as seen in user space */
   visualSize: number;
+  units: GroupUnit[];
 }
 
 interface GState {
@@ -217,14 +248,27 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
     usedFonts.add(font);
     const startTm = tm;
     const glyphs: Glyph[] = [];
+    const rawItems: (Uint8Array | number)[] = [];
+    const units: RunUnit[] = [];
+    let pre: number[] = [];
     let adv = 0;
     let minX = 0, maxX = 0;
     for (const it of items) {
       if (it.kind === 'num') {
         adv += (-it.value / 1000) * gs.fs * gs.Th;
+        rawItems.push(it.value);
+        const last = units[units.length - 1];
+        // a big positive displacement between glyphs reads as a word space (TeX-style spacing)
+        if (it.value < -180 && last && !/\s$/.test(last.text)) {
+          units.push({ kind: 'kern', text: ' ', bytes: [], code: -1, width: 0, isSpace: false, pre, tj: it.value });
+          pre = [];
+        } else pre.push(it.value);
       } else if (it.kind === 'str') {
+        rawItems.push(it.bytes);
         for (const g of font.decode(it.bytes)) {
           glyphs.push(g);
+          units.push({ kind: 'glyph', text: g.unicode, bytes: g.bytes, code: g.code, width: g.width, isSpace: g.isSpace, pre, tj: 0 });
+          pre = [];
           adv += ((g.width / 1000) * gs.fs + gs.Tc + (g.isSpace ? gs.Tw : 0)) * gs.Th;
         }
       }
@@ -239,7 +283,7 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
     runs.push({
       id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, op: op.op, quoteArgs,
       fontKey: gs.fontKey, font, fs: gs.fs, Tc: gs.Tc, Tw: gs.Tw, Th: gs.Th, TL: gs.TL, Ts: gs.Ts, Tr: gs.Tr,
-      ctm: gs.ctm, tm: startTm, glyphs, text: glyphs.map((g) => g.unicode).join(''), advance: adv,
+      ctm: gs.ctm, tm: startTm, glyphs, text: units.map((u) => u.text).join(''), advance: adv, items: rawItems, units, trailing: pre,
       color: { ...gs.fill, comps: gs.fill.comps.slice() }, alpha: gs.alpha, tlm, wm: currentWm(), bt, quad, bbox: quadToBBox(quad),
     });
   };
@@ -384,42 +428,51 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
  */
 export function groupRuns(runs: TextRun[]): TextGroup[] {
   const groups: TextGroup[] = [];
-  let cur: { runs: TextRun[]; text: string; inv: Matrix; endX: number; base: TextRun } | undefined;
+  let cur: { runs: TextRun[]; units: GroupUnit[]; inv: Matrix; endX: number; base: TextRun; dir: number } | undefined;
   const close = () => {
     if (!cur) return;
     const quad = groupQuad(cur.runs);
     const m = mul(cur.base.tm, cur.base.ctm);
     const angle = Math.atan2(m[1], m[0]);
     const visualSize = Math.abs(cur.base.fs) * Math.hypot(m[2], m[3]);
-    groups.push({ id: cur.runs[0].id, runs: cur.runs, text: cur.text, bbox: quadToBBox(quad), quad, angle, visualSize });
+    const text = cur.units.map((u) => u.text).join('');
+    groups.push({ id: cur.runs[0].id, runs: cur.runs, text, bbox: quadToBBox(quad), quad, angle, visualSize, units: cur.units });
     cur = undefined;
   };
+  const unitsOf = (r: TextRun, idx: number): GroupUnit[] => r.units.map((u) => ({ ...u, run: idx }));
   for (const r of runs) {
     if (r.glyphs.length === 0 && r.advance === 0) continue;
+    const m = mul(r.tm, r.ctm);
+    const dir = Math.atan2(m[1], m[0]);
     if (cur) {
       const b = cur.base;
-      const same = sameFamily(r.font, b.font) && Math.abs(r.fs - b.fs) < 1e-3 && Math.abs(r.Th - b.Th) < 1e-3 && r.Tr === b.Tr &&
-        sameColor(r.color, b.color) && r.alpha === b.alpha && r.wm === b.wm;
-      if (same) {
-        const m = mul(r.tm, r.ctm);
+      // a line may mix fonts, sizes and colours (bold words, currency symbols from another font…);
+      // every run keeps its own font/colour when edited
+      const compatible = (r.Tr === 3) === (b.Tr === 3) && r.wm === b.wm && Math.abs(dir - cur.dir) < 0.02;
+      if (compatible) {
         const p = apply(cur.inv, m[4], m[5]);
-        // compare orientation
-        const bm = mul(b.tm, b.ctm);
-        const sameOrient = Math.abs(m[0] - bm[0]) + Math.abs(m[1] - bm[1]) + Math.abs(m[2] - bm[2]) + Math.abs(m[3] - bm[3]) < 0.02 * (Math.abs(bm[0]) + Math.abs(bm[3]) + 1e-6);
         const fs = Math.abs(b.fs) || 1;
         const gap = p[0] - cur.endX;
-        if (sameOrient && Math.abs(p[1]) < 0.2 * fs && gap > -0.3 * fs && gap < 0.9 * fs) {
-          const needSpace = gap > 0.18 * fs && !/\s$/.test(cur.text) && !/^\s/.test(r.text);
-          cur.text += (needSpace ? ' ' : '') + r.text;
+        // run size expressed in the base frame
+        const rs = (Math.abs(r.fs) * Math.hypot(m[2], m[3])) / (Math.abs(b.fs) * Math.hypot(...(mul(b.tm, b.ctm).slice(2, 4) as [number, number])) || 1) * fs;
+        const lim = Math.max(fs, rs);
+        if (Math.abs(p[1]) < 0.35 * lim && gap > -0.3 * lim && gap < 0.9 * lim) {
+          const lastText = cur.units.length ? cur.units[cur.units.length - 1].text : '';
+          const needSpace = gap > 0.18 * lim && !/\s$/.test(lastText) && !/^\s/.test(r.text);
+          if (needSpace) {
+            const bm = mul(b.tm, b.ctm);
+            cur.units.push({ kind: 'kern', text: ' ', bytes: [], code: -1, width: 0, isSpace: false, pre: [], tj: 0, run: cur.runs.length - 1, gap: true, gapLen: gap * Math.hypot(bm[0], bm[1]) });
+          }
+          cur.units.push(...unitsOf(r, cur.runs.length));
           cur.runs.push(r);
-          cur.endX = p[0] + r.advance;
+          const pe = apply(cur.inv, ...apply(m, r.advance, 0));
+          cur.endX = pe[0];
           continue;
         }
       }
       close();
     }
-    const m = mul(r.tm, r.ctm);
-    cur = { runs: [r], text: r.text, inv: invert(m), endX: r.advance, base: r };
+    cur = { runs: [r], units: unitsOf(r, 0), inv: invert(m), endX: r.advance, base: r, dir };
   }
   close();
   return groups;

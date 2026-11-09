@@ -7,6 +7,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+import './register-fonts.ts';
 import { SourceDoc, buildPdf } from '../src/engine/engine.ts';
 import { scanDocument, type PageInfo } from '../src/engine/watermarks.ts';
 import { emptyState, type EditorState } from '../src/engine/model.ts';
