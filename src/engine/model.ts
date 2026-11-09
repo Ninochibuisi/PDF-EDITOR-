@@ -130,6 +130,8 @@ export interface EditorState {
   forms: Record<string, string | boolean | string[]>;
   /** content removed by the watermark manager: `group:<id>`, `xo:<id>`, `mc:<id>`, `annot:<ref>` per page key */
   removals: Record<string, string[]>;
+  /** document-wide: font used for characters missing from an embedded font (keyed by its name) */
+  fontMatches: Record<string, string>;
   watermarks: Watermark[];
   flattenForms: boolean;
   meta: DocMeta;
@@ -149,6 +151,7 @@ export const emptyState = (): EditorState => ({
   overlays: {},
   forms: {},
   removals: {},
+  fontMatches: {},
   watermarks: [],
   flattenForms: false,
   meta: {},

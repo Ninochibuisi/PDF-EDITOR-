@@ -29,7 +29,26 @@ import {
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings } from '@pdf-lib/standard-fonts';
 import { FontCache, type PdfFont } from './fonts.ts';
-import { planLine, type FontSlot, type Piece } from './textedit.ts';
+import { planLine, type FontSlot, type Piece, type FallbackPrefs } from './textedit.ts';
+import { parseFontProgram } from './fontprog.ts';
+
+/** Coverage check for uploaded / fetched fallback fonts (`asset:<id>`), cached per asset. */
+const coverCache = new Map<string, Map<number, number> | null>();
+export function fallbackPrefs(state: EditorState, assets: Map<string, Asset>): FallbackPrefs {
+  return {
+    matches: state.fontMatches ?? {},
+    covers: (font, ch) => {
+      if (!font.startsWith('asset:')) return true;
+      const id = font.slice(6);
+      if (!coverCache.has(id)) {
+        const a = assets.get(id);
+        coverCache.set(id, a ? parseFontProgram(a.bytes, 'FontFile2')?.unicodeCmap ?? null : null);
+      }
+      const cm = coverCache.get(id);
+      return !cm || cm.has(ch.codePointAt(0)!);
+    },
+  };
+}
 import { interpretPage, mul, apply, invert, IDENTITY, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
 import { fmtNum, hexString, latin1, nameToken, type Operand } from './lexer.ts';
 import type { Asset, EditorState, Overlay, RGB, TextEdit, Watermark } from './model.ts';
@@ -95,9 +114,9 @@ export interface EditPlan {
   borrowed: string[];
 }
 
-export function planTextEdit(group: TextGroup, edit: TextEdit, pool: PdfFont[] = []): EditPlan {
+export function planTextEdit(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [], prefs: FallbackPrefs = {}): EditPlan {
   if (edit.deleted) return { mode: 'delete', missing: [], borrowed: [] };
-  const lp = planLine(group, edit, pool);
+  const lp = planLine(group, edit, pool, prefs);
   if (lp.fallbackChars.length || edit.forceFallback)
     return { mode: 'substitute', missing: lp.fallbackChars, substituteFont: lp.fallbackFonts.join(', '), borrowed: lp.borrowedChars };
   return { mode: lp.restyle ? 'reemit-original' : 'inplace', missing: [], borrowed: lp.borrowedChars };
@@ -470,7 +489,7 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
       for (const r of group.runs) patch(r, hideRun(r));
       continue;
     }
-    const lp = planLine(group, edit, pool);
+    const lp = planLine(group, edit, pool, fallbackPrefs(state, bc.assets));
     const base = group.runs[0];
     const reflow = !edit.noReflow && !(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1));
 

@@ -85,6 +85,19 @@ console.log('\nfonts without a ToUnicode map');
   check(plan.mode === 'inplace', `new ₦ £ ( ) encoded from the full embedded font, no substitute (${plan.mode})`);
 }
 
+console.log('\nChrome / Google Docs Type3 fonts');
+{
+  const { src } = await open('tests/fixtures/chrome.pdf');
+  const g = src.model(0).groups.find((x) => x.text.includes('Skia'))!;
+  check(g.runs[0].font.isType3, `heading uses Type3 subsets (${new Set(g.runs.map((r) => r.font)).size} font objects)`);
+  const p1 = planTextEdit(g, { text: 'Skia Export Chrome' }, src.fonts.all());
+  check(p1.mode === 'inplace', `rearranged words use glyphs from the font's other subsets, no fallback (${p1.mode} ${p1.missing.join('')})`);
+  const p2 = planTextEdit(g, { text: 'Chrome, Skia Export' }, src.fonts.all());
+  check(p2.missing.join('') === ',', `a comma that exists nowhere in the file is the only fallback character (${p2.missing.join('') || 'none'})`);
+  const p3 = planTextEdit(g, { text: 'Chrome, Skia Export' }, src.fonts.all(), { matches: { [g.runs[0].font.displayName]: 'Helvetica-Bold' } });
+  check(p3.substituteFont === 'Helvetica-Bold', 'document-wide font match is used for missing characters');
+}
+
 if (hasPoppler) {
   console.log('\npixels of untouched symbols');
   const render = (b: Uint8Array, name: string) => {

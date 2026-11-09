@@ -111,7 +111,14 @@ export function diffUnits(units: GroupUnit[], text: string): Op[] {
 
 const sameFace = (a: PdfFont, b: PdfFont) => a === b || (a.displayName === b.displayName && a.subtype === b.subtype);
 
-export function planLine(group: TextGroup, edit: TextEdit, pool: PdfFont[] = []): LinePlan {
+export interface FallbackPrefs {
+  /** font chosen for characters missing from a given embedded font (by display name) */
+  matches?: Record<string, string>;
+  /** whether a fallback font can draw a character (for uploaded/fetched fonts) */
+  covers?: (font: string, ch: string) => boolean;
+}
+
+export function planLine(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [], prefs: FallbackPrefs = {}): LinePlan {
   const restyle = !!(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1) || edit.color || edit.opacity !== undefined || edit.forceFallback);
   const plan: LinePlan = { deleted: !!edit.deleted, restyle, runs: [], fallbackChars: [], fallbackFonts: [], borrowedChars: [] };
   const runs = group.runs;
@@ -220,7 +227,8 @@ export function planLine(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [])
             continue;
           }
           // 5: fallback for this character only
-          const name = edit.fallbackFont ?? autoFallback(ch, run.font);
+          const matched = prefs.matches?.[run.font.displayName];
+          const name = edit.fallbackFont ?? (matched && (prefs.covers?.(matched, ch) ?? true) ? matched : autoFallback(ch, run.font));
           const pc = piece({ kind: 'lib', name });
           pc.text += ch;
           if (!/\s/.test(ch)) plan.fallbackChars.push(ch);

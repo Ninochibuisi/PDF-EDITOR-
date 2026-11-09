@@ -176,6 +176,8 @@ export class PdfFont {
   program?: FontProgram;
   symbolic = false;
   private codeNames: (string | undefined)[] = [];
+  /** Type3: glyph procedures that exist in /CharProcs */
+  private charProcs?: Set<string>;
   private tuCodes = new Set<number>();
   private gidToUni?: Map<number, string>;
 
@@ -318,6 +320,8 @@ export class PdfFont {
     if (this.isType3) {
       const fm = arrNums(ctx, getArray(ctx, dict, 'FontMatrix'));
       this.widthScale = (fm[0] || 0.001) * 1000;
+      const cp = getDict(ctx, dict, 'CharProcs');
+      if (cp) this.charProcs = new Set(cp.keys().map((k) => k.decodeText()));
     }
     const first = getNum(ctx, dict, 'FirstChar') ?? 0;
     const ws = getArray(ctx, dict, 'Widths');
@@ -460,7 +464,11 @@ export class PdfFont {
     if (this.usedCodes.has(code)) return true;
     const p = this.programHas(code);
     if (p !== undefined) return p;
-    if (this.isType3) return false; // Type3 glyph procs: only what's used is safe
+    if (this.isType3) {
+      // Type3: a glyph exists when its procedure is in /CharProcs
+      const n = this.codeNames[code];
+      return !!(n && this.charProcs?.has(n));
+    }
     if (!this.embedded) return true; // viewer-provided font has all glyphs
     if (this.isSubset) return this.tuCodes.has(code) && this.widths.has(this.isType0 ? this.cidOf(code) : code);
     return true;
