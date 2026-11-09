@@ -22,14 +22,16 @@ import {
   degrees,
   type PDFFont as LibFont,
   type PDFPage,
+  PDFRef as PDFRefClass,
   type PDFRef,
+  type PDFObject,
 } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings } from '@pdf-lib/standard-fonts';
 import { FontCache, standardFontFor, encodeMulti, type MultiEncode, type PdfFont } from './fonts.ts';
-import { interpretPage, mul, apply, invert, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
+import { interpretPage, mul, apply, invert, IDENTITY, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
 import { fmtNum, hexString, latin1, nameToken, type Operand } from './lexer.ts';
-import type { Asset, EditorState, Overlay, RGB, TextEdit } from './model.ts';
+import type { Asset, EditorState, Overlay, RGB, TextEdit, Watermark } from './model.ts';
 import { resolve } from './pdfobj.ts';
 
 export interface SourceInfo {
@@ -63,7 +65,7 @@ export class SourceDoc {
         m = interpretPage(this.doc, i, this.fonts);
       } catch (e) {
         console.warn('interpret failed', e);
-        m = { streams: [], runs: [], xobjects: [], groups: [] };
+        m = { streams: [], runs: [], xobjects: [], groups: [], blocks: [], annots: [] };
       }
       this.models.set(i, m);
     }
@@ -244,7 +246,7 @@ interface BuildCtx {
   stdFonts: Map<string, LibFont>;
   customFonts: Map<string, LibFont>;
   assets: Map<string, Asset>;
-  images: Map<string, PDFRef>;
+  images: Map<string, { ref: PDFRef; w: number; h: number }>;
 }
 
 async function getLibFont(bc: BuildCtx, name: string): Promise<LibFont> {
@@ -273,17 +275,20 @@ async function getLibFont(bc: BuildCtx, name: string): Promise<LibFont> {
   return f;
 }
 
-async function getImageName(bc: BuildCtx, page: PDFPage, assetId: string): Promise<string | undefined> {
-  let ref = bc.images.get(assetId);
-  if (!ref) {
+async function getImage(bc: BuildCtx, page: PDFPage, assetId: string): Promise<{ name: string; w: number; h: number } | undefined> {
+  let im = bc.images.get(assetId);
+  if (!im) {
     const a = bc.assets.get(assetId);
     if (!a) return undefined;
     const img = a.kind === 'png' ? await bc.doc.embedPng(a.bytes) : await bc.doc.embedJpg(a.bytes);
     await img.embed();
-    ref = img.ref;
-    bc.images.set(assetId, ref);
+    im = { ref: img.ref, w: img.width, h: img.height };
+    bc.images.set(assetId, im);
   }
-  return page.node.newXObject('EdIm', ref).decodeText();
+  return { name: page.node.newXObject('EdIm', im.ref).decodeText(), w: im.w, h: im.h };
+}
+async function getImageName(bc: BuildCtx, page: PDFPage, assetId: string): Promise<string | undefined> {
+  return (await getImage(bc, page, assetId))?.name;
 }
 
 /** Replace characters a pdf-lib font cannot show. */
@@ -350,7 +355,11 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
   const tEdits = state.textEdits[key] ?? {};
   const xEdits = state.xobjEdits[key] ?? {};
   const redactions = (state.overlays[key] ?? []).filter((o) => o.type === 'redact');
-  if (!Object.keys(tEdits).length && !Object.keys(xEdits).length && !redactions.length) return;
+  const removals = state.removals?.[key] ?? [];
+  if (!Object.keys(tEdits).length && !Object.keys(xEdits).length && !redactions.length && !removals.length) return;
+  const ctx = bc.doc.context;
+  const alphaGs = (a: number) =>
+    page.node.newExtGState('EdGS', ctx.register(ctx.obj({ Type: 'ExtGState', ca: a, CA: a }))).decodeText();
 
   const patches = new Map<number, StreamPatch[]>();
   const patched = new Set<string>();
@@ -362,6 +371,41 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
     arr.push({ start: run.start, end: run.end, text });
   };
   let append = '';
+
+  // ---- removals from the watermark manager (applied first so they win over other patches)
+  for (const t of removals) {
+    if (t.startsWith('group:')) {
+      const g = model.groups.find((x) => x.id === t.slice(6));
+      if (g) for (const r of g.runs) patch(r, hideRun(r));
+    } else if (t.startsWith('xo:')) {
+      const xo = model.xobjects.find((x) => x.id === t.slice(3));
+      if (xo) patch(xo, '');
+    } else if (t.startsWith('mc:')) {
+      const b = model.blocks.find((x) => x.id === t);
+      if (!b) continue;
+      // keep only structural operators so q/Q, BT/ET and marked content stay balanced
+      const st = model.streams[b.stream];
+      let keep = '';
+      for (let k = b.startOp; k <= b.endOp; k++) {
+        const op = st.ops[k];
+        if (['q', 'Q', 'BT', 'ET', 'BDC', 'BMC', 'EMC'].includes(op.op)) {
+          let raw = '';
+          const bytes = st.bytes.subarray(op.start, op.end);
+          for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+          keep += raw + '\n';
+        }
+      }
+      patch({ id: b.id, stream: b.stream, start: b.start, end: b.end }, keep);
+    } else if (t.startsWith('annot:')) {
+      const ref = t.slice(6);
+      const annots = page.node.Annots();
+      if (annots) for (let i = annots.size() - 1; i >= 0; i--) {
+        const a = annots.get(i);
+        const k = a instanceof PDFRefClass ? `${a.objectNumber}_${a.generationNumber}` : `d${i}`;
+        if (k === ref) annots.remove(i);
+      }
+    }
+  }
 
   // ---- pass 1: resolve every edit, measure it, and compute inline reflow shifts
   interface Resolved { group: TextGroup; edit: TextEdit; plan: EditPlan; text: string; encoded: MultiEncode; lf?: LibFont }
@@ -379,7 +423,7 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
     const encoded = encodeGroup(group, text);
     const lf = plan.mode === 'substitute' ? await getLibFont(bc, plan.substituteFont ?? StandardFonts.Helvetica) : undefined;
     resolved.push({ group, edit, plan, text, encoded, lf });
-    const restyle = !!(edit.dx || edit.dy || (edit.scale && edit.scale !== 1));
+    const restyle = !!(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1));
     if (edit.noReflow || restyle) continue;
     let newAdv: number;
     if (plan.mode === 'delete') newAdv = 0;
@@ -438,27 +482,54 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
       for (const r of group.runs.slice(1)) patch(r, hideRun(r));
       continue;
     }
-    // re-emit at the end of the page content (moved / restyled / substitute font)
+    // redraw (moved / restyled / substitute font)
     for (const r of group.runs) patch(r, hideRun(r));
     const scale = edit.scale ?? 1;
     const fs = base.fs * scale;
-    const color = edit.color ? rgbOps(edit.color) : colorOps(base.color);
     const dx = (edit.dx ?? 0) + (sh?.[0] ?? 0);
     const dy = (edit.dy ?? 0) + (sh?.[1] ?? 0);
-    const shift = dx || dy ? `1 0 0 1 ${fmtNum(dx)} ${fmtNum(dy)} cm ` : '';
-    let fontPart: string;
     let show: string;
-    if (plan.mode === 'reemit-original') {
-      fontPart = `${nameToken(base.fontKey)} ${fmtNum(fs)} Tf ${fmtNum(base.Tc * scale)} Tc ${fmtNum(base.Tw * scale)} Tw`;
-      show = showSegments(group, encoded, fs, 0);
-    } else {
+    if (plan.mode === 'reemit-original') show = showSegments(group, encoded, fs, scale === 1 ? 0 : -1);
+    else {
       const fk = page.node.newFontDictionary('EdF', lf!.ref).decodeText();
-      fontPart = `${nameToken(fk)} ${fmtNum(fs)} Tf 0 Tc 0 Tw`;
-      show = libEncode(lf!, text) + ' Tj';
+      show = `${nameToken(fk)} ${fmtNum(fs)} Tf ${libEncode(lf!, text)} Tj`;
     }
-    append +=
-      `q ${shift}${mat(base.ctm)} cm BT ${fontPart} ${fmtNum(base.Th * 100)} Tz ${fmtNum(base.Ts * scale)} Ts ${fmtNum(base.Tr)} Tr ${color} ` +
-      `${mat(base.tm)} Tm ${show} ET Q\n`;
+    // user-space transform (move + rotate about the start of the baseline)
+    let userM: Matrix = [1, 0, 0, 1, dx, dy];
+    if (edit.rotate) {
+      const [px, py] = apply(mul(base.tm, base.ctm), 0, 0);
+      const a = (edit.rotate * Math.PI) / 180;
+      userM = mul(mul(mul([1, 0, 0, 1, -px, -py], [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), 0, 0]), [1, 0, 0, 1, px, py]), userM);
+    }
+    const ident = Math.abs(userM[0] - 1) + Math.abs(userM[1]) + Math.abs(userM[2]) + Math.abs(userM[3] - 1) + Math.abs(userM[4]) + Math.abs(userM[5]) < 1e-9;
+    const stroked = [1, 2, 5, 6].includes(base.Tr);
+    let state = '';
+    if (scale !== 1) state += `${fmtNum(base.Tc * scale)} Tc ${fmtNum(base.Tw * scale)} Tw ${fmtNum(base.Ts * scale)} Ts `;
+    if (edit.color) state += rgbOps(edit.color) + ' ' + (stroked ? rgbOps(edit.color, true) + ' ' : '');
+    const gsOp = edit.opacity !== undefined ? `${nameToken(alphaGs(edit.opacity))} gs ` : '';
+
+    if (base.Tr < 4) {
+      // In-stream redraw: the text is painted at its original position in the content stream, inside the
+      // original graphics state – colour space, shade, transparency, blend mode, clipping and stacking
+      // order are inherited untouched. Only what you changed is set explicitly.
+      const local = ident ? '' : `${mat(mul(mul(base.ctm, userM), invert(base.ctm)))} cm `;
+      const tmAfter = mul([1, 0, 0, 1, base.advance, 0], base.tm);
+      const R = mul(tmAfter, invert(base.tlm));
+      let restore: string;
+      if (Math.abs(R[0] - 1) + Math.abs(R[1]) + Math.abs(R[2]) + Math.abs(R[3] - 1) + Math.abs(R[5]) < 1e-6) {
+        const k = kernFor(base, R[4]);
+        restore = `${mat(base.tlm)} Tm` + (Math.abs(k) > 1e-6 ? ` [${fmtNum(k)}] TJ` : '');
+      } else restore = `${mat(tmAfter)} Tm`;
+      const prev = patches.get(base.stream)!.find((p) => p.start === base.start)!;
+      prev.text += ` ET q ${gsOp}${local}BT ${mat(base.tm)} Tm ${state}${show} ET Q BT ${restore}`;
+    } else {
+      // clipping text modes: drawing order matters for the clip, so draw separately after the page
+      const color = edit.color ? rgbOps(edit.color) : colorOps(base.color);
+      const shift = ident ? '' : `${mat(userM)} cm `;
+      append +=
+        `q ${gsOp}${shift}${mat(base.ctm)} cm BT ${nameToken(base.fontKey)} ${fmtNum(fs)} Tf ${fmtNum(base.Th * 100)} Tz ${fmtNum(base.Ts * scale)} Ts ${fmtNum(base.Tr)} Tr ${color} ` +
+        `${mat(base.tm)} Tm ${show} ET Q\n`;
+    }
   }
 
   // untouched runs that must slide along their line
@@ -482,18 +553,19 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
       continue;
     }
     if (!e.dx && !e.dy && !e.replaceAsset) continue;
-    const original = model.streams[xo.stream].bytes.subarray(xo.start, xo.end);
-    patch(xo, '');
-    const shift = e.dx || e.dy ? `1 0 0 1 ${fmtNum(e.dx ?? 0)} ${fmtNum(e.dy ?? 0)} cm ` : '';
+    // redraw in place (same graphics state: opacity, blend, clip and stacking order are kept)
+    const T: Matrix = [1, 0, 0, 1, e.dx ?? 0, e.dy ?? 0];
+    const inv = invert(xo.ctm);
     if (e.replaceAsset) {
-      const nm = await getImageName(bc, page, e.replaceAsset);
-      if (!nm) continue;
-      const m = xo.subtype === 'Image' || xo.subtype === 'Inline' ? xo.ctm : bboxMatrix(xo);
-      append += `q ${shift}${mat(m)} cm ${nameToken(nm)} Do Q\n`;
+      const im = await getImage(bc, page, e.replaceAsset);
+      if (!im) continue;
+      const target = xo.subtype === 'Form' ? mul(bboxMatrix(xo), T) : mul(xo.ctm, T);
+      patch(xo, `q ${mat(mul(target, inv))} cm ${nameToken(im.name)} Do Q`);
     } else {
+      const original = model.streams[xo.stream].bytes.subarray(xo.start, xo.end);
       let raw = '';
       for (let i = 0; i < original.length; i++) raw += String.fromCharCode(original[i]);
-      append += `q ${shift}${mat(xo.ctm)} cm ${raw} Q\n`;
+      patch(xo, `q ${mat(mul(mul(xo.ctm, T), inv))} cm ${raw} Q`);
     }
   }
 
@@ -540,10 +612,10 @@ export function uprightFrame(o: { x: number; y: number; w: number; h: number; ro
   }
 }
 
-async function drawOverlays(bc: BuildCtx, page: PDFPage, overlays: Overlay[]) {
-  if (!overlays.length) return;
+async function drawOverlays(bc: BuildCtx, page: PDFPage, overlays: Overlay[], under = '', over = '') {
+  if (!overlays.length && !under && !over) return;
   const ctx = bc.doc.context;
-  let out = '';
+  let out = over;
   const gsName = (opacity: number, multiply = false) => {
     const d = ctx.obj({ Type: 'ExtGState', ca: opacity, CA: opacity, ...(multiply ? { BM: 'Multiply' } : {}) });
     return page.node.newExtGState('EdGS', ctx.register(d)).decodeText();
@@ -555,14 +627,188 @@ async function drawOverlays(bc: BuildCtx, page: PDFPage, overlays: Overlay[]) {
       console.warn('overlay skipped', o.type, e);
     }
   }
-  const ref = ctx.register(ctx.flateStream(latin1(out)));
-  // wrap existing content in q/Q so overlays start from a clean graphics state
+  // wrap existing content in q/Q so additions start from a clean graphics state
   const raw = page.node.get(PDFName.of('Contents'));
   const r = resolve(ctx, raw);
-  const list = r instanceof PDFArray ? r.asArray() : raw ? [raw] : [];
-  const pre = ctx.register(ctx.flateStream(enc.encode('q\n')));
-  const post = ctx.register(ctx.flateStream(enc.encode('\nQ\n')));
-  page.node.set(PDFName.of('Contents'), ctx.obj(list.length ? [pre, ...list, post, ref] : [ref]));
+  const list: PDFObject[] = r instanceof PDFArray ? r.asArray() : raw ? [raw] : [];
+  const parts: PDFObject[] = [];
+  if (under) parts.push(ctx.register(ctx.flateStream(latin1(under))));
+  if (list.length) {
+    parts.push(ctx.register(ctx.flateStream(enc.encode('q\n'))), ...list, ctx.register(ctx.flateStream(enc.encode('\nQ\n'))));
+  }
+  if (out) parts.push(ctx.register(ctx.flateStream(latin1(out))));
+  page.node.set(PDFName.of('Contents'), ctx.obj(parts));
+}
+
+// ---------------------------------------------------------------------------
+// Watermarks
+// ---------------------------------------------------------------------------
+export function parsePageSpec(spec: string, total: number): Set<number> {
+  const out = new Set<number>();
+  if (!spec.trim()) {
+    for (let i = 1; i <= total; i++) out.add(i);
+    return out;
+  }
+  for (const part of spec.split(/[,;\s]+/)) {
+    const m = /^(\d+)?\s*-\s*(\d+)?$/.exec(part);
+    if (m) {
+      const a = m[1] ? +m[1] : 1, b = m[2] ? +m[2] : total;
+      for (let i = Math.max(1, a); i <= Math.min(total, b); i++) out.add(i);
+    } else if (/^\d+$/.test(part)) {
+      const n = +part;
+      if (n >= 1 && n <= total) out.add(n);
+    } else if (/^odd$/i.test(part)) for (let i = 1; i <= total; i += 2) out.add(i);
+    else if (/^even$/i.test(part)) for (let i = 2; i <= total; i += 2) out.add(i);
+  }
+  return out;
+}
+
+async function drawWatermarks(bc: BuildCtx, page: PDFPage, wms: Watermark[]): Promise<{ under: string; over: string }> {
+  let under = '', over = '';
+  const ctx = bc.doc.context;
+  const box = page.getCropBox();
+  const { m, W, H } = uprightFrame({ x: box.x, y: box.y, w: box.width, h: box.height, rot: page.getRotation().angle });
+  for (const wm of wms) {
+    try {
+      const a = (wm.angle * Math.PI) / 180;
+      const cos = Math.cos(a), sin = Math.sin(a);
+      let w: number, h: number, draw: string;
+      if (wm.kind === 'image' && wm.asset) {
+        const im = await getImage(bc, page, wm.asset);
+        if (!im) continue;
+        w = W * (wm.imageScale ?? 0.5);
+        h = (w * im.h) / im.w;
+        draw = `${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(-w / 2)} ${fmtNum(-h / 2)} cm ${nameToken(im.name)} Do`;
+      } else {
+        const lf = await getLibFont(bc, wm.font);
+        const fk = page.node.newFontDictionary('EdWm', lf.ref).decodeText();
+        const txt = libClean(lf, wm.text || ' ');
+        w = lf.widthOfTextAtSize(txt, wm.size);
+        h = lf.heightAtSize(wm.size, { descender: false }) * 0.72;
+        draw = `BT ${nameToken(fk)} ${fmtNum(wm.size)} Tf ${rgbOps(wm.color)} 1 0 0 1 ${fmtNum(-w / 2)} ${fmtNum(-h / 2)} Tm ${lf.encodeText(txt).toString()} Tj ET`;
+      }
+      const ew = Math.abs(w * cos) + Math.abs(h * sin), eh = Math.abs(w * sin) + Math.abs(h * cos);
+      const margin = Math.min(W, H) * 0.06;
+      const centers: [number, number][] = [];
+      const pos = wm.position;
+      if (pos === 'tile') {
+        const g = wm.gap ?? 1;
+        const sx = (ew + Math.max(40, wm.size * 2)) * g, sy = (eh + Math.max(40, wm.size * 2)) * g;
+        let row = 0;
+        for (let y = sy / 2; y < H + sy; y += sy, row++) for (let x = (row % 2 ? sx / 2 : 0); x < W + sx; x += sx) centers.push([x, y]);
+      } else {
+        const cx = pos.includes('left') ? margin + ew / 2 : pos.includes('right') ? W - margin - ew / 2 : W / 2;
+        const cy = pos.startsWith('top') ? margin + eh / 2 : pos.startsWith('bottom') ? H - margin - eh / 2 : H / 2;
+        centers.push([cx, cy]);
+      }
+      const gsn = page.node.newExtGState('EdWmGS', ctx.register(ctx.obj({ Type: 'ExtGState', ca: wm.opacity, CA: wm.opacity }))).decodeText();
+      let out = `/Artifact <</Type /Pagination /Subtype /Watermark>> BDC q ${nameToken(gsn)} gs\n`;
+      for (const [cx, cy] of centers) {
+        const M = mul(mul([cos, sin, -sin, cos, 0, 0], [1, 0, 0, 1, cx, -cy]), m);
+        out += `q ${mat(M)} cm ${draw} Q\n`;
+      }
+      out += 'Q EMC\n';
+      if (wm.layer === 'under') under += out;
+      else over += out;
+    } catch (e) {
+      console.warn('watermark skipped', e);
+    }
+  }
+  return { under, over };
+}
+
+// ---------------------------------------------------------------------------
+// Incremental (lossless) save: the original bytes are kept verbatim and only
+// changed / new objects are appended in an update section.
+// ---------------------------------------------------------------------------
+function objBytes(o: PDFObject): Uint8Array {
+  const b = new Uint8Array(o.sizeInBytes());
+  o.copyBytesInto(b, 0);
+  return b;
+}
+function sameBytes(a: Uint8Array, b: Uint8Array) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Highest /Size declared by any trailer or xref stream in the file. */
+function declaredSize(bytes: Uint8Array): number {
+  const txt = new TextDecoder('latin1').decode(bytes.length > 4_000_000 ? bytes.subarray(bytes.length - 4_000_000) : bytes);
+  let max = 0;
+  for (const m of txt.matchAll(/\/Size\s+(\d+)/g)) max = Math.max(max, +m[1]);
+  return max;
+}
+
+export async function saveIncremental(original: Uint8Array, built: PDFDocument): Promise<Uint8Array> {
+  await built.flush();
+  const orig = await PDFDocument.load(original, { ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
+  orig.getPages(); // normalise the same way the built document was
+  const changed: [PDFRef, PDFObject][] = [];
+  for (const [ref, obj] of built.context.enumerateIndirectObjects()) {
+    const o = orig.context.lookup(ref);
+    if (!o || !sameBytes(objBytes(o), objBytes(obj))) changed.push([ref, obj]);
+  }
+  if (!changed.length) return original;
+  const tail = new TextDecoder('latin1').decode(original.subarray(Math.max(0, original.length - 2048)));
+  const m = /startxref\s+(\d+)\s*%%EOF\s*$/.exec(tail) ?? /startxref\s+(\d+)/.exec(tail);
+  if (!m) throw new Error('no startxref');
+  const prev = +m[1];
+  const chunks: Uint8Array[] = [original];
+  let offset = original.length;
+  const push = (b: Uint8Array) => { chunks.push(b); offset += b.length; };
+  if (original[original.length - 1] !== 0x0a) push(enc.encode('\n'));
+  const offsets: { num: number; gen: number; off: number }[] = [];
+  for (const [ref, obj] of changed) {
+    offsets.push({ num: ref.objectNumber, gen: ref.generationNumber, off: offset });
+    push(enc.encode(`${ref.objectNumber} ${ref.generationNumber} obj\n`));
+    push(objBytes(obj));
+    push(enc.encode('\nendobj\n'));
+  }
+  const t = built.context.trailerInfo;
+  const refStr = (r: unknown) => (r instanceof PDFRefClass ? `${r.objectNumber} ${r.generationNumber} R` : '');
+  let common = `/Root ${refStr(t.Root)} /Prev ${prev}`;
+  if (t.Info instanceof PDFRefClass) common += ` /Info ${refStr(t.Info)}`;
+  if (t.ID) common += ` /ID ${new TextDecoder('latin1').decode(objBytes(t.ID))}`;
+  const prevIsStream = /^\s*\d+\s+\d+\s+obj/.test(new TextDecoder('latin1').decode(original.subarray(prev, prev + 32)));
+  let size = Math.max(built.context.largestObjectNumber, ...offsets.map((o) => o.num)) + 1;
+  const xrefAt = offset;
+  if (prevIsStream) {
+    // the original uses a cross-reference stream: append one too (PDF 1.5+)
+    const own = size++;
+    offsets.push({ num: own, gen: 0, off: xrefAt });
+    offsets.sort((a, b) => a.num - b.num);
+    const index: number[] = [];
+    const data: number[] = [];
+    for (let i = 0; i < offsets.length; ) {
+      let j = i;
+      while (j + 1 < offsets.length && offsets[j + 1].num === offsets[j].num + 1) j++;
+      index.push(offsets[i].num, j - i + 1);
+      for (let k = i; k <= j; k++) {
+        const { off, gen } = offsets[k];
+        data.push(1, (off >>> 24) & 255, (off >>> 16) & 255, (off >>> 8) & 255, off & 255, (gen >> 8) & 255, gen & 255);
+      }
+      i = j + 1;
+    }
+    push(enc.encode(`${own} 0 obj\n<< /Type /XRef /Size ${size} /W [1 4 2] /Index [${index.join(' ')}] ${common} /Length ${data.length} >>\nstream\n`));
+    push(Uint8Array.from(data));
+    push(enc.encode(`\nendstream\nendobj\nstartxref\n${xrefAt}\n%%EOF\n`));
+  } else {
+    offsets.sort((a, b) => a.num - b.num);
+    let x = 'xref\n';
+    for (let i = 0; i < offsets.length; ) {
+      let j = i;
+      while (j + 1 < offsets.length && offsets[j + 1].num === offsets[j].num + 1) j++;
+      x += `${offsets[i].num} ${j - i + 1}\n`;
+      for (let k = i; k <= j; k++) x += `${String(offsets[k].off).padStart(10, '0')} ${String(offsets[k].gen).padStart(5, '0')} n\r\n`;
+      i = j + 1;
+    }
+    push(enc.encode(`${x}trailer\n<< /Size ${size} ${common} >>\nstartxref\n${xrefAt}\n%%EOF\n`));
+  }
+  const out = new Uint8Array(offset);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
 }
 
 async function drawOverlay(bc: BuildCtx, page: PDFPage, o: Overlay, gsName: (opacity: number, multiply?: boolean) => string): Promise<string> {
@@ -649,6 +895,8 @@ async function drawOverlay(bc: BuildCtx, page: PDFPage, o: Overlay, gsName: (opa
 }
 
 export interface BuildOptions {
+  /** keep the original file bytes and append only the changes (lossless, signature-friendly) */
+  incremental?: boolean;
   /** used for export: drop the object-stream compression for maximum compatibility */
   compat?: boolean;
 }
@@ -665,8 +913,11 @@ export async function buildPdf(
   const load = async (id: string) => {
     let d = fresh.get(id);
     if (!d) {
-      d = await PDFDocument.load(sources.get(id)!.info.bytes, { ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
+      const bytes = sources.get(id)!.info.bytes;
+      d = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
       d.registerFontkit(fontkit);
+      // never reuse object numbers of the original file (xref streams / object streams aren't kept by pdf-lib)
+      d.context.largestObjectNumber = Math.max(d.context.largestObjectNumber, declaredSize(bytes) - 1);
       fresh.set(id, d);
     }
     return d;
@@ -728,13 +979,18 @@ export async function buildPdf(
     if (slot.rotate) page.setRotation(degrees((((page.getRotation().angle + slot.rotate) % 360) + 360) % 360));
   }
 
-  // 4. overlays (in the primary document context)
+  // 4. overlays + watermarks (in the primary document context)
   const pbc = bcOf(primary);
-  for (const slot of state.pages) {
+  const wms = (state.watermarks ?? []).filter((w) => w.enabled);
+  const wmPages = wms.map((w) => parsePageSpec(w.pages, state.pages.length));
+  for (let i = 0; i < state.pages.length; i++) {
+    const slot = state.pages[i];
     const page = pageObjs.get(slot.key)!;
     const ovs = (state.overlays[slot.key] ?? []).slice();
-    if (!ovs.length) continue;
-    await drawOverlays(pbc, page, ovs.filter((o) => o.type !== 'redact').concat(ovs.filter((o) => o.type === 'redact')));
+    const here = wms.filter((_, k) => wmPages[k].has(i + 1));
+    if (!ovs.length && !here.length) continue;
+    const { under, over } = here.length ? await drawWatermarks(pbc, page, here) : { under: '', over: '' };
+    await drawOverlays(pbc, page, ovs.filter((o) => o.type !== 'redact').concat(ovs.filter((o) => o.type === 'redact')), under, over);
   }
 
   // 5. forms
@@ -766,6 +1022,14 @@ export async function buildPdf(
   if (m.subject !== undefined) primary.setSubject(m.subject);
   if (m.keywords !== undefined) primary.setKeywords(m.keywords.split(',').map((s) => s.trim()).filter(Boolean));
 
+  if (opts.incremental && !sources.get(primaryId)!.encrypted) {
+    try {
+      if (Object.keys(state.forms).length && !state.flattenForms) primary.getForm().updateFieldAppearances();
+      return await saveIncremental(sources.get(primaryId)!.info.bytes, primary);
+    } catch (e) {
+      console.warn('incremental save failed, rebuilding instead', e);
+    }
+  }
   return primary.save({ useObjectStreams: !opts.compat, updateFieldAppearances: true });
 }
 

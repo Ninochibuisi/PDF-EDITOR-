@@ -3,9 +3,10 @@ import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from 'pdfjs-dist';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings, Font as StdFont, type IFontNames } from '@pdf-lib/standard-fonts';
+import { scanDocument, type ScanReport, type DetectedWatermark } from '../engine/watermarks.ts';
 import { SourceDoc, buildPdf, planTextEdit, listFields, unsupportedStandardChars, uprightFrame, STANDARD_FONT_NAMES, type FieldInfo } from '../engine/engine.ts';
 import type { TextGroup, XObjectRun, FillColor } from '../engine/interpreter.ts';
-import { emptyState, uid, type Asset, type EditorState, type Overlay, type PageSlot, type RGB, type TextEdit, type TextOverlay } from '../engine/model.ts';
+import { emptyState, uid, type Asset, type EditorState, type Overlay, type PageSlot, type RGB, type TextEdit, type TextOverlay, type Watermark, type WatermarkPosition } from '../engine/model.ts';
 import { h, icon, toast, pickFiles, download, hexToRgb, rgbToHex } from './dom.ts';
 
 type Tool = 'select' | 'edittext' | 'objects' | 'text' | 'image' | 'sign' | 'rect' | 'ellipse' | 'line' | 'arrow' | 'ink' | 'highlight' | 'whiteout' | 'redact';
@@ -63,7 +64,10 @@ export class App {
   views: PageView[] = [];
   selection: Selection = null;
   currentPage = 0;
-  tab: 'props' | 'find' | 'forms' | 'doc' = 'props';
+  tab: 'props' | 'find' | 'wm' | 'forms' | 'doc' = 'props';
+  report?: ScanReport;
+  scanning = false;
+  wmOpen: string | null = null;
   fields: FieldInfo[] = [];
   style = { stroke: [0.86, 0.15, 0.27] as RGB, fill: null as RGB | null, lineWidth: 2, textColor: [0.07, 0.07, 0.1] as RGB, fontSize: 14, font: 'Helvetica', highlight: [1, 0.85, 0.1] as RGB, opacity: 1 };
   findQuery = '';
@@ -119,7 +123,7 @@ export class App {
       h('button', { class: 'btn icon', title: 'Zoom in (+)', onclick: () => this.setZoom(this.zoom * 1.2) }, icon('plus')),
       h('button', { class: 'btn icon', title: 'Fit width', onclick: () => this.fitWidth() }, icon('fit')),
       h('div', { class: 'sep' }),
-      h('button', { class: 'btn primary', title: 'Export PDF (Ctrl+S)', onclick: () => this.exportPdf() }, icon('save'), 'Export PDF'),
+      h('button', { class: 'btn primary', title: 'Export PDF (Ctrl+S)', onclick: () => this.exportPdf('lossless') }, icon('save'), 'Export PDF'),
     );
     this.toolsEl = h('div', { class: 'tools' });
     for (const t of TOOLS) {
@@ -192,7 +196,7 @@ export class App {
     const t = e.target as HTMLElement;
     const typing = t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName);
     const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); this.exportPdf(); return; }
+    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); this.exportPdf('lossless'); return; }
     if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); this.openDialog(); return; }
     if (mod && e.key.toLowerCase() === 'f') { e.preventDefault(); this.tab = 'find'; this.renderTabs(); (this.tabbody.querySelector('input') as HTMLInputElement)?.focus(); return; }
     if (typing) return;
@@ -269,9 +273,41 @@ export class App {
     this.viewer.querySelector('.empty')?.remove();
     if (src.encrypted) toast('This PDF is encrypted. Viewing works, but edits to encrypted content may not apply.', true, 6000);
     this.zoom = 1;
+    this.report = undefined;
     await this.rebuild(true);
     this.fitWidth();
     this.renderTabs();
+    this.smartScan();
+  }
+
+  /** Analyse every page in the background (fonts, text lines, images, watermarks, scanned pages). */
+  async smartScan() {
+    if (this.scanning) return;
+    this.scanning = true;
+    const todo = this.state.pages.map((p) => this.sourceOf(p.key)).filter((x): x is { src: SourceDoc; index: number } => !!x);
+    for (let k = 0; k < todo.length; k++) {
+      todo[k].src.model(todo[k].index);
+      if (k % 4 === 3) {
+        this.setStatus(`Smart scan ${k + 1}/${todo.length}…`, true);
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    this.scanning = false;
+    this.computeReport();
+    const n = this.report!.watermarks.length;
+    this.setStatus(`Smart scan complete · ${this.state.pages.length} pages`);
+    if (n) toast(`Smart scan found ${n} watermark${n > 1 ? 's' : ''} – see the Watermarks tab`, false, 4000);
+    this.renderTabs();
+  }
+
+  computeReport() {
+    const infos = this.state.pages.flatMap((p, i) => {
+      const s = this.sourceOf(p.key);
+      if (!s) return [];
+      const ps = s.src.pageSize(s.index);
+      return [{ key: p.key, number: i + 1, model: s.src.model(s.index), box: ps.box }];
+    });
+    this.report = scanDocument(infos);
   }
 
   async insertFiles(files: File[], silent = false) {
@@ -319,6 +355,7 @@ export class App {
     if (!silent) toast(`Inserted ${newPages.length} page${newPages.length > 1 ? 's' : ''}`);
     await this.rebuild(true);
     this.scrollToPage(at);
+    this.smartScan();
     at += newPages.length;
   }
 
@@ -641,7 +678,9 @@ export class App {
     // text groups
     if (this.tool === 'edittext' || this.tool === 'highlight' || this.tool === 'redact' || this.tool === 'whiteout') {
       const edits = this.state.textEdits[key] ?? {};
+      const removed = new Set(this.state.removals[key] ?? []);
       for (const g of this.groupsOf(key)) {
+        if (removed.has('group:' + g.id) || (g.runs[0].wm && removed.has(g.runs[0].wm))) continue;
         const e = edits[g.id];
         if (e?.deleted && this.tool !== 'edittext') continue;
         const dx = e?.dx ?? 0, dy = e?.dy ?? 0;
@@ -669,7 +708,9 @@ export class App {
     // objects
     if (this.tool === 'objects') {
       const edits = this.state.xobjEdits[key] ?? {};
+      const removedX = new Set(this.state.removals[key] ?? []);
       for (const xo of this.xobjectsOf(key)) {
+        if (removedX.has('xo:' + xo.id) || (xo.wm && removedX.has(xo.wm))) continue;
         const e = edits[xo.id];
         const dx = e?.dx ?? 0, dy = e?.dy ?? 0;
         const r = this.rectPx(v, xo.bbox.x0 + dx, xo.bbox.y0 + dy, xo.bbox.x1 + dx, xo.bbox.y1 + dy);
@@ -1203,7 +1244,8 @@ export class App {
     tabs.innerHTML = '';
     const mk = (id: typeof this.tab, label: string) =>
       h('button', { class: this.tab === id ? 'active' : '', onclick: () => { this.tab = id; this.renderTabs(); } }, label);
-    tabs.append(mk('props', 'Properties'), mk('find', 'Find'), mk('forms', `Forms${this.fields.length ? ` (${this.fields.length})` : ''}`), mk('doc', 'Document'));
+    const nwm = this.report?.watermarks.length ?? 0;
+    tabs.append(mk('props', 'Edit'), mk('find', 'Find'), mk('wm', `Watermarks${nwm ? ` (${nwm})` : ''}`), mk('forms', `Forms${this.fields.length ? ` (${this.fields.length})` : ''}`), mk('doc', 'Doc'));
     const scroll = this.tabbody.scrollTop;
     this.tabbody.innerHTML = '';
     if (!this.primaryId) {
@@ -1213,6 +1255,7 @@ export class App {
     if (this.tab === 'props') this.renderProps();
     else if (this.tab === 'find') this.renderFind();
     else if (this.tab === 'forms') this.renderForms();
+    else if (this.tab === 'wm') this.renderWatermarks();
     else this.renderDoc();
     this.tabbody.scrollTop = scroll;
   }
@@ -1289,6 +1332,9 @@ export class App {
         colorRow('Color', e.color ?? fillToRgb(run.color), (c) => this.updateTextEdit(key, gid, (x) => { x.color = c; })),
         h('div', { class: 'row' }, h('label', {}, 'Offset'), h('span', { class: 'muted' }, `${(e.dx ?? 0).toFixed(1)}, ${(e.dy ?? 0).toFixed(1)} pt`),
           e.dx || e.dy ? h('button', { class: 'btn small', onclick: () => this.updateTextEdit(key, gid, (x) => { x.dx = undefined; x.dy = undefined; }) }, 'Reset') : null),
+        rangeRow('Opacity', +(e.opacity ?? run.alpha).toFixed(2), 0, 1, 0.01, (n) => this.updateTextEdit(key, gid, (x) => { x.opacity = Math.abs(n - run.alpha) < 1e-3 ? undefined : n; }), true),
+        h('div', { class: 'row' }, h('label', {}, 'Rotate°'), h('input', { type: 'number', step: '1', value: String(e.rotate ?? 0), onchange: (ev: Event) => { const v = parseFloat((ev.target as HTMLInputElement).value) || 0; this.updateTextEdit(key, gid, (x) => { x.rotate = v || undefined; }); } })),
+        h('div', { class: 'hint', style: 'margin:-2px 0 8px' }, 'Untouched properties are inherited from the original – colour space, shade, transparency and layering stay exactly as they were.'),
         h('div', { class: 'row' }, h('label', {}, 'Reflow'), h('input', { type: 'checkbox', checked: !e.noReflow, onchange: (ev: Event) => this.updateTextEdit(key, gid, (x) => { x.noReflow = (ev.target as HTMLInputElement).checked ? undefined : true; }) }), h('span', { class: 'hint' }, 'slide the rest of the line')),
       ),
       h('div', { class: 'sec' }, h('h4', {}, 'Font'),
@@ -1500,6 +1546,159 @@ export class App {
     this.drawLayer(v);
   }
 
+  // ---------------- watermarks ----------------
+  isRemoved(d: DetectedWatermark) {
+    return d.hits.every((h) => h.targets.every((t) => this.state.removals[h.key]?.includes(t)));
+  }
+  setRemoved(d: DetectedWatermark, on: boolean) {
+    this.commit((s) => {
+      for (const h of d.hits) {
+        const cur = new Set(s.removals[h.key] ?? []);
+        for (const t of h.targets) (on ? cur.add(t) : cur.delete(t));
+        if (cur.size) s.removals[h.key] = [...cur];
+        else delete s.removals[h.key];
+      }
+    });
+  }
+  editDetected(d: DetectedWatermark, fn: (e: TextEdit) => void) {
+    this.commit((s) => {
+      for (const h of d.hits) for (const gid of h.groupIds) {
+        const e = ((s.textEdits[h.key] ??= {})[gid] ??= {});
+        fn(e);
+        for (const k of Object.keys(e) as (keyof TextEdit)[]) if (e[k] === undefined) delete e[k];
+        if (!Object.keys(e).length) delete s.textEdits[h.key][gid];
+      }
+    });
+  }
+  newWatermark(kind: 'text' | 'image', base?: Partial<Watermark>): Watermark {
+    return { id: uid('w'), kind, text: 'CONFIDENTIAL', font: 'Helvetica-Bold', size: 64, color: [0.75, 0.12, 0.12], opacity: kind === 'image' ? 0.2 : 0.25, angle: kind === 'image' ? 0 : 45, position: 'center', layer: 'over', pages: '', enabled: true, imageScale: 0.5, gap: 1, ...base };
+  }
+  updWm(id: string, fn: (w: Watermark) => void) {
+    this.commit((s) => { const w = s.watermarks.find((x) => x.id === id); if (w) fn(w); });
+  }
+
+  renderWatermarks() {
+    const b = this.tabbody;
+    const r = this.report;
+    // --- smart scan summary
+    const scan = h('div', { class: 'sec' }, h('h4', {}, 'Smart scan'));
+    if (!r || this.scanning) scan.append(h('div', { class: 'hint' }, 'Scanning every page for watermarks, fonts and structure…'));
+    else {
+      scan.append(h('div', { class: 'hint' }, `${r.pages} pages · ${r.textLines} text lines · ${r.images} images · ${r.fonts} fonts`));
+      if (r.scannedPages.length) scan.append(h('div', { class: 'pill warn', style: 'margin-top:6px;white-space:normal' }, `Page${r.scannedPages.length > 1 ? 's' : ''} ${r.scannedPages.join(', ')} look scanned (image only) – annotate, redact or watermark them; their text is a picture.`));
+      if (r.invisibleTextPages.length) scan.append(h('div', { class: 'pill info', style: 'margin-top:6px;white-space:normal' }, `Hidden OCR text layer on page${r.invisibleTextPages.length > 1 ? 's' : ''} ${r.invisibleTextPages.join(', ')} – searchable and editable.`));
+      scan.append(h('div', { class: 'btns', style: 'margin-top:8px' }, h('button', { class: 'btn small', onclick: () => { this.computeReport(); this.renderTabs(); } }, 'Rescan')));
+    }
+    b.append(scan);
+
+    // --- detected
+    const det = h('div', { class: 'sec' }, h('h4', {}, `Detected in this document (${r?.watermarks.length ?? 0})`));
+    if (r && !r.watermarks.length) det.append(h('div', { class: 'hint' }, 'No watermarks found. Add one below.'));
+    for (const d of r?.watermarks ?? []) {
+      const removed = this.isRemoved(d);
+      const firstHit = d.hits[0];
+      const editable = !removed && d.hits.every((x) => x.groupIds.length === 1);
+      const cur = editable ? this.state.textEdits[firstHit.key]?.[firstHit.groupIds[0]] ?? {} : {};
+      const card = h('div', { class: 'match', style: `cursor:default;${removed ? 'opacity:.6' : ''}` },
+        h('div', { style: 'display:flex;justify-content:space-between;gap:6px;align-items:center' },
+          h('b', { style: 'background:none;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, (cur.text ?? d.label).slice(0, 40)),
+          h('span', { class: `pill ${d.confidence === 'certain' ? 'ok' : 'warn'}` }, d.confidence)),
+        h('div', { class: 'pg', style: 'margin:3px 0 8px' }, `${({ artifact: 'Tagged watermark', acrobat: 'Acrobat watermark', annotation: 'Annotation', text: 'Text', image: 'Image' } as Record<string, string>)[d.kind]} · ${d.hits.length} page${d.hits.length > 1 ? 's' : ''} · ${d.reason}`),
+      );
+      if (editable && d.sample) {
+        const smp = d.sample;
+        card.append(
+          h('div', { class: 'row' }, h('label', {}, 'Text'), h('input', { type: 'text', value: cur.text ?? smp.text, onchange: (e: Event) => { const v = (e.target as HTMLInputElement).value; this.editDetected(d, (x) => { x.text = v === smp.text ? undefined : v; }); } })),
+          rangeRow('Opacity', +(cur.opacity ?? smp.opacity).toFixed(2), 0.02, 1, 0.01, (n) => this.editDetected(d, (x) => { x.opacity = Math.abs(n - smp.opacity) < 1e-3 ? undefined : n; }), true),
+          colorRow('Colour', cur.color ?? smp.color, (c) => this.editDetected(d, (x) => { x.color = c; })),
+          h('div', { class: 'row' }, h('label', {}, 'Size %'), h('input', { type: 'number', step: '5', value: String(Math.round((cur.scale ?? 1) * 100)), onchange: (e: Event) => { const v = parseFloat((e.target as HTMLInputElement).value) / 100; this.editDetected(d, (x) => { x.scale = v > 0 && Math.abs(v - 1) > 1e-3 ? v : undefined; }); } })),
+          h('div', { class: 'row' }, h('label', {}, 'Angle°'), h('input', { type: 'number', step: '1', value: String(Math.round(smp.angle + (cur.rotate ?? 0))), onchange: (e: Event) => { const v = parseFloat((e.target as HTMLInputElement).value) - smp.angle; this.editDetected(d, (x) => { x.rotate = Math.abs(v) > 0.01 ? v : undefined; }); } })),
+          h('div', { class: 'hint', style: 'margin-bottom:6px' }, `Edited in place on every page${smp.font ? ` with its own font (${smp.font})` : ''}.`),
+        );
+      }
+      card.append(h('div', { class: 'btns' },
+        removed
+          ? h('button', { class: 'btn small', onclick: () => this.setRemoved(d, false) }, 'Restore')
+          : h('button', { class: 'btn small danger', onclick: () => this.setRemoved(d, true) }, icon('trash'), `Remove from ${d.hits.length} page${d.hits.length > 1 ? 's' : ''}`),
+        h('button', { class: 'btn small', onclick: () => this.revealHit(d) }, 'Show'),
+        !removed && d.sample ? h('button', { class: 'btn small', onclick: () => {
+          const smp = d.sample!;
+          const w = this.newWatermark('text', { text: smp.text, size: smp.size, angle: smp.angle, color: smp.color, opacity: smp.opacity, font: /bold/i.test(smp.font) ? 'Helvetica-Bold' : 'Helvetica' });
+          this.setRemoved(d, true);
+          this.commit((s) => { s.watermarks.push(w); });
+          this.wmOpen = w.id;
+          this.renderTabs();
+        } }, 'Replace with new…') : null,
+        editable && Object.keys(cur).length ? h('button', { class: 'btn small', onclick: () => this.commit((s) => { for (const x of d.hits) for (const gid of x.groupIds) delete s.textEdits[x.key]?.[gid]; }) }, 'Reset') : null,
+      ));
+      det.append(card);
+    }
+    b.append(det);
+
+    // --- added watermarks
+    const add = h('div', { class: 'sec' }, h('h4', {}, 'Your watermarks'),
+      h('div', { class: 'btns', style: 'margin-bottom:10px' },
+        h('button', { class: 'btn small primary', onclick: () => { const w = this.newWatermark('text'); this.commit((s) => { s.watermarks.push(w); }); this.wmOpen = w.id; this.renderTabs(); } }, icon('plus'), 'Text watermark'),
+        h('button', { class: 'btn small', onclick: async () => {
+          const [f] = await pickFiles('image/png,image/jpeg');
+          if (!f) return;
+          const a: Asset = { id: uid('a'), kind: /png/i.test(f.type) || /\.png$/i.test(f.name) ? 'png' : 'jpg', name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) };
+          this.assets.set(a.id, a);
+          const w = this.newWatermark('image', { asset: a.id, text: f.name });
+          this.commit((s) => { s.watermarks.push(w); });
+          this.wmOpen = w.id;
+          this.renderTabs();
+        } }, icon('image'), 'Image / logo')));
+    if (!this.state.watermarks.length) add.append(h('div', { class: 'hint' }, 'Watermarks you add stay editable here – change the text, angle, opacity or pages any time, even after re-opening the exported file (they are tagged as standard PDF watermark artifacts).'));
+    for (const w of this.state.watermarks) {
+      const open = this.wmOpen === w.id;
+      const card = h('div', { class: 'match', style: 'cursor:default' },
+        h('div', { style: 'display:flex;gap:8px;align-items:center' },
+          h('input', { type: 'checkbox', checked: w.enabled, title: 'Show / hide', onchange: (e: Event) => this.updWm(w.id, (x) => { x.enabled = (e.target as HTMLInputElement).checked; }) }),
+          h('b', { style: 'background:none;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, w.kind === 'image' ? `🖼 ${w.text}` : w.text || '(empty)'),
+          h('button', { class: 'btn small', onclick: () => { this.wmOpen = open ? null : w.id; this.renderTabs(); } }, open ? 'Done' : 'Edit'),
+          h('button', { class: 'btn small icon', title: 'Duplicate', onclick: () => this.commit((s) => { s.watermarks.push({ ...structuredClone(w), id: uid('w') }); }) }, icon('plus')),
+          h('button', { class: 'btn small icon danger', title: 'Delete', onclick: () => this.commit((s) => { s.watermarks = s.watermarks.filter((x) => x.id !== w.id); }) }, icon('trash'))),
+        h('div', { class: 'pg', style: 'margin-top:4px' }, `${w.position} · ${w.angle}° · ${Math.round(w.opacity * 100)}% · ${w.layer === 'under' ? 'behind content' : 'over content'} · ${w.pages ? 'pages ' + w.pages : 'all pages'}`));
+      if (open) {
+        const f = h('div', { style: 'margin-top:10px' });
+        if (w.kind === 'text') f.append(
+          h('div', { class: 'row' }, h('label', {}, 'Text'), h('input', { type: 'text', value: w.text, onchange: (e: Event) => this.updWm(w.id, (x) => { x.text = (e.target as HTMLInputElement).value; }) })),
+          fontRow(w.font, this.assets, (v) => this.updWm(w.id, (x) => { x.font = v; })),
+          numRow('Size', w.size, (n) => this.updWm(w.id, (x) => { x.size = n; })),
+          colorRow('Colour', w.color, (c) => this.updWm(w.id, (x) => { x.color = c; })),
+          !w.font.startsWith('asset:') && unsupportedStandardChars(w.text).length ? h('div', { class: 'pill warn', style: 'margin-bottom:8px;white-space:normal' }, `${unsupportedStandardChars(w.text).join(' ')} need an uploaded font`) : '',
+        );
+        else f.append(rangeRow('Width %', Math.round((w.imageScale ?? 0.5) * 100), 5, 150, 1, (n) => this.updWm(w.id, (x) => { x.imageScale = n / 100; }), true));
+        f.append(
+          rangeRow('Opacity', w.opacity, 0.02, 1, 0.01, (n) => this.updWm(w.id, (x) => { x.opacity = n; }), true),
+          rangeRow('Angle°', w.angle, -90, 90, 1, (n) => this.updWm(w.id, (x) => { x.angle = n; }), true),
+          h('div', { class: 'row' }, h('label', {}, 'Position'), h('select', { onchange: (e: Event) => this.updWm(w.id, (x) => { x.position = (e.target as HTMLSelectElement).value as WatermarkPosition; }) },
+            ...(['center', 'tile', 'top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right'] as const).map((p) => h('option', { value: p, selected: w.position === p }, p)))),
+          w.position === 'tile' ? rangeRow('Spacing', w.gap ?? 1, 0.5, 3, 0.1, (n) => this.updWm(w.id, (x) => { x.gap = n; }), true) : '',
+          h('div', { class: 'row' }, h('label', {}, 'Layer'), h('select', { onchange: (e: Event) => this.updWm(w.id, (x) => { x.layer = (e.target as HTMLSelectElement).value as 'over'; }) },
+            h('option', { value: 'over', selected: w.layer === 'over' }, 'Over content'), h('option', { value: 'under', selected: w.layer === 'under' }, 'Behind content'))),
+          h('div', { class: 'row' }, h('label', {}, 'Pages'), h('input', { type: 'text', placeholder: 'all  (e.g. 1-3, 5, odd)', value: w.pages, onchange: (e: Event) => this.updWm(w.id, (x) => { x.pages = (e.target as HTMLInputElement).value; }) })),
+        );
+        card.append(f);
+      }
+      add.append(card);
+    }
+    b.append(add);
+  }
+
+  revealHit(d: DetectedWatermark) {
+    const hit = d.hits[0];
+    const i = this.state.pages.findIndex((p) => p.key === hit.key);
+    if (i < 0) return;
+    const v = this.views[i];
+    const r = this.rectPx(v, hit.bbox.x0, hit.bbox.y0, hit.bbox.x1, hit.bbox.y1);
+    this.viewer.scrollTo({ top: v.el.offsetTop + r.top - 80, behavior: 'smooth' });
+    const flash = h('div', { class: 'draft', style: `left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;border-color:#f5b942;background:#f5b94233` });
+    v.layer.appendChild(flash);
+    setTimeout(() => flash.remove(), 1600);
+  }
+
   // ---------------- forms ----------------
   renderForms() {
     const b = this.tabbody;
@@ -1533,10 +1732,21 @@ export class App {
       h('div', { class: 'row' }, h('label', {}, label), h('input', { type: 'text', value: m[k] ?? cur ?? '', onchange: (e: Event) => this.commit((s) => { s.meta[k] = (e.target as HTMLInputElement).value; }) }));
     b.append(h('div', { class: 'sec' }, h('h4', {}, 'Export'),
       h('div', { class: 'btns' },
-        h('button', { class: 'btn primary small', onclick: () => this.exportPdf() }, icon('save'), 'Download PDF'),
-        h('button', { class: 'btn small', onclick: () => this.exportPng() }, icon('png'), 'Current page as PNG'),
-        h('button', { class: 'btn small', onclick: () => this.exportPdf(true) }, 'PDF (max compatibility)')),
-      h('div', { class: 'hint', style: 'margin-top:8px' }, 'Untouched pages and objects are carried over byte-for-byte; only the operators you changed are rewritten.')));
+        h('button', { class: 'btn primary small', onclick: () => this.exportPdf('lossless') }, icon('save'), 'Lossless PDF'),
+        h('button', { class: 'btn small', onclick: () => this.exportPdf('compact') }, 'Rebuilt & compact'),
+        h('button', { class: 'btn small', onclick: () => this.exportPdf('compat') }, 'Max compatibility'),
+        h('button', { class: 'btn small', onclick: () => this.exportPng() }, icon('png'), 'Page as PNG')),
+      h('div', { class: 'hint', style: 'margin-top:8px' }, h('b', {}, 'Lossless'), ' keeps every byte of the original file and appends only your changes (incremental update) – images, fonts, colour profiles and everything you didn\'t touch stay bit-identical. ', h('b', {}, 'Rebuilt'), ' rewrites the file compactly with the same content.')));
+    if (this.report) {
+      const r = this.report;
+      b.append(h('div', { class: 'sec' }, h('h4', {}, 'Smart scan'), h('div', { class: 'kv' },
+        h('div', {}, 'Text lines'), h('div', {}, String(r.textLines)),
+        h('div', {}, 'Images'), h('div', {}, String(r.images)),
+        h('div', {}, 'Fonts'), h('div', {}, String(r.fonts)),
+        h('div', {}, 'Watermarks'), h('div', {}, String(r.watermarks.length)),
+        h('div', {}, 'Scanned pages'), h('div', {}, r.scannedPages.length ? r.scannedPages.join(', ') : 'none'),
+        h('div', {}, 'OCR text layer'), h('div', {}, r.invisibleTextPages.length ? 'pages ' + r.invisibleTextPages.join(', ') : 'none'))));
+    }
     b.append(h('div', { class: 'sec' }, h('h4', {}, 'Metadata'),
       metaRow('Title', 'title', d.getTitle()), metaRow('Author', 'author', d.getAuthor()), metaRow('Subject', 'subject', d.getSubject()), metaRow('Keywords', 'keywords', d.getKeywords())));
     // font inventory
@@ -1563,11 +1773,11 @@ export class App {
   }
 
   // ---------------- export ----------------
-  async exportPdf(compat = false) {
+  async exportPdf(mode: 'lossless' | 'compact' | 'compat' = 'lossless') {
     if (!this.primaryId) return;
     this.setStatus('Exporting…', true);
     try {
-      const bytes = await buildPdf(this.sources, this.primaryId, this.state, this.assets, { compat });
+      const bytes = await buildPdf(this.sources, this.primaryId, this.state, this.assets, { incremental: mode === 'lossless', compat: mode === 'compat' });
       const name = this.fileName.replace(/\.pdf$/i, '') + (this.undoStack.length ? '-edited' : '') + '.pdf';
       download(bytes, name);
       toast(`Exported ${name} (${(bytes.length / 1024).toFixed(0)} KB)`);

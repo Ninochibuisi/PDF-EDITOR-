@@ -25,6 +25,10 @@ export interface TextEdit {
   fallbackFont?: string;
   /** don't slide the rest of the line when the text width changes */
   noReflow?: boolean;
+  /** new fill opacity (0..1); omitted = keep the original transparency exactly */
+  opacity?: number;
+  /** extra rotation in degrees (counter-clockwise) around the start of the baseline */
+  rotate?: number;
 }
 
 export interface XObjectEdit {
@@ -92,12 +96,41 @@ export interface DocMeta {
   keywords?: string;
 }
 
+export type WatermarkPosition = 'center' | 'tile' | 'top' | 'bottom' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+/** A watermark added by the editor (stays fully editable; tagged as a PDF watermark artifact). */
+export interface Watermark {
+  id: string;
+  kind: 'text' | 'image';
+  text: string;
+  /** standard font name or `asset:<id>` */
+  font: string;
+  size: number;
+  color: RGB;
+  opacity: number;
+  /** degrees, counter-clockwise as seen on screen */
+  angle: number;
+  position: WatermarkPosition;
+  layer: 'over' | 'under';
+  /** '' = all pages, otherwise e.g. "1-3, 7" (final page numbers) */
+  pages: string;
+  asset?: string;
+  /** image width as a fraction of the page width */
+  imageScale?: number;
+  /** tile spacing multiplier */
+  gap?: number;
+  enabled: boolean;
+}
+
 export interface EditorState {
   pages: PageSlot[];
   textEdits: Record<string, Record<string, TextEdit>>;
   xobjEdits: Record<string, Record<string, XObjectEdit>>;
   overlays: Record<string, Overlay[]>;
   forms: Record<string, string | boolean | string[]>;
+  /** content removed by the watermark manager: `group:<id>`, `xo:<id>`, `mc:<id>`, `annot:<ref>` per page key */
+  removals: Record<string, string[]>;
+  watermarks: Watermark[];
   flattenForms: boolean;
   meta: DocMeta;
 }
@@ -115,6 +148,8 @@ export const emptyState = (): EditorState => ({
   xobjEdits: {},
   overlays: {},
   forms: {},
+  removals: {},
+  watermarks: [],
   flattenForms: false,
   meta: {},
 });

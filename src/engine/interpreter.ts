@@ -72,9 +72,32 @@ export interface TextRun {
   /** total x displacement in text space */
   advance: number;
   color: FillColor;
+  /** fill opacity from the active ExtGState */
+  alpha: number;
+  /** text line matrix at the time of showing (to restore state after an in-stream redraw) */
+  tlm: Matrix;
+  /** id of the enclosing watermark artifact block, if any */
+  wm?: string;
   bt: number;
   quad: [number, number][];
   bbox: BBox;
+}
+
+export interface MarkedBlock {
+  id: string;
+  stream: number;
+  startOp: number;
+  endOp: number;
+  start: number;
+  end: number;
+  /** marked-content tag + properties text, for display */
+  label: string;
+}
+
+export interface WatermarkAnnot {
+  id: string;
+  ref: string;
+  rect: BBox;
 }
 
 export interface XObjectRun {
@@ -86,6 +109,9 @@ export interface XObjectRun {
   name: string;
   subtype: 'Image' | 'Form' | 'Inline';
   ctm: Matrix;
+  alpha: number;
+  /** enclosing watermark block id, or 'piece' for an Acrobat watermark form */
+  wm?: string;
   quad: [number, number][];
   bbox: BBox;
 }
@@ -101,6 +127,8 @@ export interface PageModel {
   runs: TextRun[];
   xobjects: XObjectRun[];
   groups: TextGroup[];
+  blocks: MarkedBlock[];
+  annots: WatermarkAnnot[];
 }
 
 export interface TextGroup {
@@ -128,6 +156,7 @@ interface GState {
   fontKey: string;
   font?: PdfFont;
   fs: number;
+  alpha: number;
 }
 
 const num = (o: Operand | undefined) => (o && o.kind === 'num' ? o.value : 0);
@@ -166,7 +195,15 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
 
   let gs: GState = {
     ctm: IDENTITY, fill: { op: 'g', comps: [0] }, fillCS: 'DeviceGray',
-    Tc: 0, Tw: 0, Th: 1, TL: 0, Ts: 0, Tr: 0, fontKey: '', fs: 0,
+    Tc: 0, Tw: 0, Th: 1, TL: 0, Ts: 0, Tr: 0, fontKey: '', fs: 0, alpha: 1,
+  };
+  const gsDict = getDict(ctx, resources, 'ExtGState');
+  const propDict = getDict(ctx, resources, 'Properties');
+  const blocks: MarkedBlock[] = [];
+  const mcStack: { wm: boolean; s: number; i: number; start: number; label: string }[] = [];
+  const currentWm = () => {
+    for (let k = mcStack.length - 1; k >= 0; k--) if (mcStack[k].wm) return `mc:${mcStack[k].s}:${mcStack[k].i}`;
+    return undefined;
   };
   const stack: GState[] = [];
   let tm: Matrix = IDENTITY;
@@ -203,7 +240,7 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
       id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, op: op.op, quoteArgs,
       fontKey: gs.fontKey, font, fs: gs.fs, Tc: gs.Tc, Tw: gs.Tw, Th: gs.Th, TL: gs.TL, Ts: gs.Ts, Tr: gs.Tr,
       ctm: gs.ctm, tm: startTm, glyphs, text: glyphs.map((g) => g.unicode).join(''), advance: adv,
-      color: { ...gs.fill, comps: gs.fill.comps.slice() }, bt, quad, bbox: quadToBBox(quad),
+      color: { ...gs.fill, comps: gs.fill.comps.slice() }, alpha: gs.alpha, tlm, wm: currentWm(), bt, quad, bbox: quadToBBox(quad),
     });
   };
 
@@ -232,6 +269,39 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
           break;
         }
         case 'BT': tm = IDENTITY; tlm = IDENTITY; bt++; break;
+        case 'gs': {
+          const nm = a[0]?.kind === 'name' ? a[0].value : '';
+          const d = gsDict ? resolve(ctx, gsDict.get(PDFName.of(nm))) : undefined;
+          if (d instanceof PDFDict) {
+            const ca = resolve(ctx, d.get(PDFName.of('ca')));
+            const n = (ca as { asNumber?: () => number } | undefined)?.asNumber?.();
+            if (typeof n === 'number') gs.alpha = n;
+          }
+          break;
+        }
+        case 'BMC': mcStack.push({ wm: false, s, i, start: op.start, label: a[0]?.kind === 'name' ? a[0].value : '' }); break;
+        case 'BDC': {
+          const tag = a[0]?.kind === 'name' ? a[0].value : '';
+          let sub = '', typ = '', label = tag;
+          const p = a[1];
+          if (p?.kind === 'dict') {
+            const st = p.entries.Subtype, ty = p.entries.Type;
+            if (st?.kind === 'name') sub = st.value;
+            if (ty?.kind === 'name') typ = ty.value;
+          } else if (p?.kind === 'name' && propDict) {
+            const pd = resolve(ctx, propDict.get(PDFName.of(p.value)));
+            if (pd instanceof PDFDict) { sub = getName(ctx, pd, 'Subtype') ?? ''; typ = getName(ctx, pd, 'Type') ?? ''; }
+          }
+          if (sub) label += ' ' + sub;
+          void typ;
+          mcStack.push({ wm: tag === 'Artifact' && sub === 'Watermark', s, i, start: op.start, label });
+          break;
+        }
+        case 'EMC': {
+          const b = mcStack.pop();
+          if (b?.wm && b.s === s) blocks.push({ id: `mc:${b.s}:${b.i}`, stream: s, startOp: b.i, endOp: i, start: b.start, end: op.end, label: b.label });
+          break;
+        }
         case 'ET': break;
         case 'Tc': gs.Tc = num(a[0]); break;
         case 'Tw': gs.Tw = num(a[0]); break;
@@ -279,20 +349,33 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
               const mm = mul(m, gs.ctm);
               quad = [apply(mm, r[0], r[1]), apply(mm, r[2], r[1]), apply(mm, r[2], r[3]), apply(mm, r[0], r[3])];
             }
-            xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name, subtype: sub, ctm: gs.ctm, quad, bbox: quadToBBox(quad) });
+            const piece = sub === 'Form' && d && dictGet(ctx, d, 'PieceInfo') ? String(dictGet(ctx, d, 'PieceInfo')).includes('Watermark') : false;
+            xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name, subtype: sub, ctm: gs.ctm, alpha: gs.alpha, wm: currentWm() ?? (piece ? 'piece' : undefined), quad, bbox: quadToBBox(quad) });
           }
           break;
         }
         case 'BI': {
           const quad: [number, number][] = [apply(gs.ctm, 0, 0), apply(gs.ctm, 1, 0), apply(gs.ctm, 1, 1), apply(gs.ctm, 0, 1)];
-          xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name: '', subtype: 'Inline', ctm: gs.ctm, quad, bbox: quadToBBox(quad) });
+          xobjects.push({ id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, name: '', subtype: 'Inline', ctm: gs.ctm, alpha: gs.alpha, wm: currentWm(), quad, bbox: quadToBBox(quad) });
           break;
         }
       }
     });
   });
   for (const f of usedFonts) f.touch();
-  return { streams, runs, xobjects, groups: groupRuns(runs) };
+  // watermark annotations
+  const annots: WatermarkAnnot[] = [];
+  const an = page.node.Annots();
+  if (an) for (let k = 0; k < an.size(); k++) {
+    const raw = an.get(k);
+    const ad = resolve(ctx, raw);
+    if (ad instanceof PDFDict && getName(ctx, ad, 'Subtype') === 'Watermark') {
+      const r = (dictGet(ctx, ad, 'Rect') as PDFArray | undefined)?.asArray().map((x) => (resolve(ctx, x) as { asNumber?: () => number })?.asNumber?.() ?? 0) ?? [0, 0, 0, 0];
+      const ref = raw instanceof PDFRef ? `${raw.objectNumber}_${raw.generationNumber}` : `d${k}`;
+      annots.push({ id: `annot:${ref}`, ref, rect: { x0: Math.min(r[0], r[2]), y0: Math.min(r[1], r[3]), x1: Math.max(r[0], r[2]), y1: Math.max(r[1], r[3]) } });
+    }
+  }
+  return { streams, runs, xobjects, groups: groupRuns(runs), blocks, annots };
 }
 
 /**
@@ -315,7 +398,8 @@ export function groupRuns(runs: TextRun[]): TextGroup[] {
     if (r.glyphs.length === 0 && r.advance === 0) continue;
     if (cur) {
       const b = cur.base;
-      const same = sameFamily(r.font, b.font) && Math.abs(r.fs - b.fs) < 1e-3 && Math.abs(r.Th - b.Th) < 1e-3 && r.Tr === b.Tr;
+      const same = sameFamily(r.font, b.font) && Math.abs(r.fs - b.fs) < 1e-3 && Math.abs(r.Th - b.Th) < 1e-3 && r.Tr === b.Tr &&
+        sameColor(r.color, b.color) && r.alpha === b.alpha && r.wm === b.wm;
       if (same) {
         const m = mul(r.tm, r.ctm);
         const p = apply(cur.inv, m[4], m[5]);
@@ -339,6 +423,10 @@ export function groupRuns(runs: TextRun[]): TextGroup[] {
   }
   close();
   return groups;
+}
+
+function sameColor(a: FillColor, b: FillColor): boolean {
+  return a.op === b.op && a.cs === b.cs && a.pattern === b.pattern && a.comps.length === b.comps.length && a.comps.every((v, i) => Math.abs(v - b.comps[i]) < 1e-6);
 }
 
 function sameFamily(a: PdfFont, b: PdfFont): boolean {

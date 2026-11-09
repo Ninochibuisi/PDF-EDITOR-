@@ -1,4 +1,4 @@
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, degrees } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -39,3 +39,28 @@ console.log('fixtures ok');
   writeFileSync('tests/fixtures/form.pdf', await d.save());
 }
 console.log('form fixture ok');
+
+// colour / transparency fixture
+{
+  const d = await PDFDocument.create();
+  const p = d.addPage([612, 792]);
+  const f = await d.embedFont(StandardFonts.TimesRoman);
+  p.drawRectangle({ x: 60, y: 560, width: 500, height: 120, color: rgb(0.85, 0.93, 1) });
+  p.drawText('Semi transparent crimson headline', { x: 72, y: 640, size: 26, font: f, color: rgb(0.8, 0.1, 0.3), opacity: 0.6 });
+  p.drawText('Teal body copy that must keep its exact shade', { x: 72, y: 600, size: 14, font: f, color: rgb(0.05, 0.5, 0.5) });
+  p.drawText('Untouched reference line', { x: 72, y: 520, size: 14, font: f, color: rgb(0.3, 0.3, 0.3) });
+  writeFileSync('tests/fixtures/color.pdf', await d.save());
+}
+// untagged watermark fixture (what most tools produce)
+{
+  const d = await PDFDocument.create();
+  const f = await d.embedFont(StandardFonts.Helvetica);
+  const fb = await d.embedFont(StandardFonts.HelveticaBold);
+  for (let i = 0; i < 3; i++) {
+    const p = d.addPage([612, 792]);
+    p.drawText(`Page ${i + 1} body text of the contract.`, { x: 72, y: 700, size: 12, font: f });
+    p.drawText('CONFIDENTIAL', { x: 150, y: 300, size: 64, font: fb, color: rgb(0.6, 0.6, 0.6), opacity: 0.3, rotate: degrees(45) });
+  }
+  writeFileSync('tests/fixtures/watermarked.pdf', await d.save());
+}
+console.log('quality fixtures ok');
