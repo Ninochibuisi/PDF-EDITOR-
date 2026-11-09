@@ -54,6 +54,10 @@ const P: Record<string, string> = {
   hand: '<path d="M18 11V6a2 2 0 0 0-4 0v5M14 10V4a2 2 0 0 0-4 0v6M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.9-6-2.4l-3.6-3.6a2 2 0 0 1 2.8-2.8L7 15"/>',
   png: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 13l3 3 5-6"/>',
   check: '<path d="M5 12l5 5L20 7"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  alignl: '<path d="M4 6h16M4 10h10M4 14h16M4 18h10"/>',
+  alignc: '<path d="M4 6h16M7 10h10M4 14h16M7 18h10"/>',
+  alignr: '<path d="M4 6h16M10 10h10M4 14h16M10 18h10"/>',
 };
 
 export function icon(name: string): SVGSVGElement {

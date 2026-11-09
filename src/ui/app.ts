@@ -4,6 +4,7 @@ import { PDFDocument, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings, Font as StdFont, type IFontNames } from '@pdf-lib/standard-fonts';
 import { downloadMatch, prettyName, editorFontFamily, cssWeight } from './fontmatch.ts';
+import { detectAlignment, snapTargets } from '../engine/layout.ts';
 import { scanDocument, type ScanReport, type DetectedWatermark } from '../engine/watermarks.ts';
 import { fallbackPrefs, SourceDoc, buildPdf, planTextEdit, listFields, unsupportedStandardChars, uprightFrame, STANDARD_FONT_NAMES, type FieldInfo } from '../engine/engine.ts';
 import type { TextGroup, XObjectRun, FillColor } from '../engine/interpreter.ts';
@@ -128,6 +129,7 @@ export class App {
       this.zoomLabel,
       h('button', { class: 'btn icon', title: 'Zoom in (+)', onclick: () => this.setZoom(this.zoom * 1.2) }, icon('plus')),
       h('button', { class: 'btn icon', title: 'Fit width', onclick: () => this.fitWidth() }, icon('fit')),
+      h('button', { class: 'btn icon', title: 'Clean view – hide editing guides and see the page exactly as it exports (G)', onclick: () => this.toggleClean() }, icon('eye')),
       h('div', { class: 'sep' }),
       h('button', { class: 'btn primary', title: 'Export PDF (Ctrl+S)', onclick: () => this.exportPdf('lossless') }, icon('save'), 'Export PDF'),
     );
@@ -210,6 +212,8 @@ export class App {
     if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); this.redo(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') { if (this.selection) { e.preventDefault(); this.deleteSelection(); } return; }
     if (e.key === 'Escape') { this.select(null); return; }
+    if (this.selection && e.key.startsWith('Arrow')) { e.preventDefault(); this.nudge(e.key, e.shiftKey ? 10 : 1); return; }
+    if (!mod && e.key.toLowerCase() === 'g') { this.toggleClean(); return; }
     if (e.key === '+' || e.key === '=') { this.setZoom(this.zoom * 1.2); return; }
     if (e.key === '-') { this.setZoom(this.zoom / 1.2); return; }
     if (!mod && !e.altKey) {
@@ -280,6 +284,7 @@ export class App {
     if (src.encrypted) toast('This PDF is encrypted. Viewing works, but edits to encrypted content may not apply.', true, 6000);
     this.zoom = 1;
     this.report = undefined;
+    this.alignCache.clear();
     await this.rebuild(true);
     this.fitWidth();
     this.renderTabs();
@@ -377,11 +382,15 @@ export class App {
     this.redoStack = [];
     this.updateHistoryButtons();
   }
-  commit(fn: (s: EditorState) => void, opts: { structural?: boolean } = {}) {
+  private lastMerge = { key: '', at: 0 };
+  commit(fn: (s: EditorState) => void, opts: { structural?: boolean; mergeKey?: string } = {}) {
     const before = this.snapshot();
     fn(this.state);
     if (this.snapshot() === before) return;
-    this.pushUndo(before);
+    const now = Date.now();
+    // a burst of the same small action (e.g. arrow-key nudges) is one undo step
+    if (!(opts.mergeKey && this.lastMerge.key === opts.mergeKey && now - this.lastMerge.at < 1500)) this.pushUndo(before);
+    this.lastMerge = { key: opts.mergeKey ?? '', at: now };
     this.scheduleBuild(opts.structural);
     this.renderTabs();
   }
@@ -696,15 +705,26 @@ export class App {
         const e = edits[g.id];
         if (e?.deleted && this.tool !== 'edittext') continue;
         const dx = e?.dx ?? 0, dy = e?.dy ?? 0;
-        const r = this.rectPx(v, g.bbox.x0 + dx, g.bbox.y0 + dy, g.bbox.x1 + dx, g.bbox.y1 + dy);
-        if (e?.text !== undefined && !e.fit && Math.abs(g.angle) < 0.01) {
-          // the outline follows the edited text (measured in the editor's font)
-          const f = g.runs[0].font;
-          measureCanvas.font = `${cssWeight(f.baseFont, f.bold)} ${g.visualSize * (e.scale ?? 1) * this.zoom}px ${this.editorFamily(f)}`;
-          const ratio = measureCanvas.measureText(e.text).width / Math.max(1, measureCanvas.measureText(g.text).width);
-          r.width = Math.max(4, r.width * ratio);
-        }
+        const lay = this.lineLayout(key, g, e);
+        const r = lay.flat
+          ? this.rectPx(v, lay.x0 + dx, g.bbox.y0 + dy, lay.x0 + lay.w + dx, g.bbox.y1 + dy)
+          : this.rectPx(v, g.bbox.x0 + dx, g.bbox.y0 + dy, g.bbox.x1 + dx, g.bbox.y1 + dy);
         const sel = this.selection?.kind === 'text' && this.selection.key === key && this.selection.id === g.id;
+        if (sel && lay.flat && this.tool === 'edittext') {
+          // the line's box: drag the side handles to widen / narrow it (the text itself is not scaled)
+          // show the box around the text even when the text is wider than it (handles stay outside the text)
+          const off = lay.x0 - g.bbox.x0;
+          const shown: [number, number] = e?.frame ? lay.frame : [Math.min(lay.frame[0], off), Math.max(lay.frame[1], off + lay.w)];
+          const fr = this.rectPx(v, g.bbox.x0 + shown[0] + dx, g.bbox.y0 + dy, g.bbox.x0 + shown[1] + dx, g.bbox.y1 + dy);
+          const frameEl = h('div', { class: 'frame', style: `left:${fr.left - 3}px;top:${fr.top - 4}px;width:${fr.width + 6}px;height:${fr.height + 8}px` },
+            h('span', { class: 'frame-tag' }, `${{ left: 'Left', center: 'Centre', right: 'Right' }[lay.align]}${!e?.align || e.align === 'auto' ? ' (auto)' : ''}`));
+          for (const side of ['l', 'r'] as const) {
+            const hd = h('div', { class: `fhandle ${side}`, title: 'Drag to resize the text box' });
+            hd.addEventListener('pointerdown', (ev) => this.startFrameResize(ev, v, key, g, side, shown, frameEl));
+            frameEl.appendChild(hd);
+          }
+          L.appendChild(frameEl);
+        }
         const box = h('div', {
           class: `hit text${e ? ' edited' : ''}${sel ? ' selected' : ''}`,
           'data-sel': `text|${key}|${g.id}`,
@@ -712,6 +732,7 @@ export class App {
           title: g.text,
         });
         if (this.tool === 'edittext') this.bindDrag(box, v, {
+          snap: (px, py) => this.snapMove(v, key, r, px, py, g),
           onClick: () => this.openTextEditor(v, g),
           onDragEnd: (ddx, ddy) => this.commit((s) => {
             const ed = ((s.textEdits[key] ??= {})[g.id] ??= {});
@@ -766,6 +787,7 @@ export class App {
       });
       if (active) {
         this.bindDrag(box, v, {
+          snap: (px, py) => this.snapMove(v, key, r, px, py),
           onDown: () => this.select({ kind: 'ov', key, id: o.id }, false),
           onClick: () => this.drawLayer(v),
           onDblClick: () => o.type === 'text' && this.openOverlayEditor(v, o),
@@ -785,7 +807,7 @@ export class App {
   }
 
   /** Pointer handling: click vs drag for hit boxes. Calls onDragEnd with a user-space delta. */
-  bindDrag(el: HTMLElement, v: PageView, cb: { onClick: () => void; onDragEnd: (dx: number, dy: number) => void; onDown?: () => void; onDblClick?: () => void }) {
+  bindDrag(el: HTMLElement, v: PageView, cb: { onClick: () => void; onDragEnd: (dx: number, dy: number) => void; onDown?: () => void; onDblClick?: () => void; snap?: (dx: number, dy: number) => [number, number] }) {
     el.addEventListener('dblclick', (e) => { e.stopPropagation(); cb.onDblClick?.(); });
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
@@ -795,22 +817,153 @@ export class App {
       let dragging = false;
       el.setPointerCapture(e.pointerId);
       cb.onDown?.();
+      let last: [number, number] = [0, 0];
       const move = (ev: PointerEvent) => {
-        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        let dx = ev.clientX - sx, dy = ev.clientY - sy;
         if (!dragging && Math.hypot(dx, dy) > 4) dragging = true;
-        if (dragging) el.style.transform = `translate(${dx}px,${dy}px)`;
+        if (!dragging) return;
+        // snap to page centre / other lines (hold Alt to move freely)
+        if (cb.snap && !ev.altKey) [dx, dy] = cb.snap(dx, dy);
+        else this.clearGuides(v);
+        last = [dx, dy];
+        el.style.transform = `translate(${dx}px,${dy}px)`;
       };
-      const up = (ev: PointerEvent) => {
+      const up = () => {
         el.removeEventListener('pointermove', move);
         el.removeEventListener('pointerup', up);
+        this.clearGuides(v);
         if (dragging) {
-          const a = this.toPdf(v, 0, 0), b = this.toPdf(v, ev.clientX - sx, ev.clientY - sy);
+          const a = this.toPdf(v, 0, 0), b = this.toPdf(v, last[0], last[1]);
           cb.onDragEnd(b[0] - a[0], b[1] - a[1]);
         } else cb.onClick();
       };
       el.addEventListener('pointermove', move);
       el.addEventListener('pointerup', up);
     });
+  }
+
+  // ------------------------------------------------------------------ layout helpers
+  /** where an (edited) line sits: mirrors the engine's alignment logic for on-screen boxes */
+  lineLayout(key: string, g: TextGroup, e?: TextEdit) {
+    const flat = Math.abs(Math.sin(g.angle)) < 0.02 && Math.cos(g.angle) > 0;
+    const W0 = g.bbox.x1 - g.bbox.x0;
+    let W1 = W0;
+    if (e?.text !== undefined) {
+      const f = g.runs[0].font;
+      measureCanvas.font = `${cssWeight(f.baseFont, f.bold)} 100px ${this.editorFamily(f)}`;
+      W1 = W0 * (measureCanvas.measureText(e.text).width / Math.max(1, measureCanvas.measureText(g.text).width));
+    }
+    W1 *= e?.scale ?? 1;
+    const frame: [number, number] = e?.frame ?? [0, W0];
+    if (e?.fit && W1 > frame[1] - frame[0]) W1 = frame[1] - frame[0];
+    const align = e?.align && e.align !== 'auto' ? e.align : this.detectedAlign(key, g).align;
+    const off = e?.noReflow ? 0 : align === 'center' ? (frame[0] + frame[1]) / 2 - W1 / 2 : align === 'right' ? frame[1] - W1 : frame[0];
+    return { flat, x0: g.bbox.x0 + off, w: W1, frame, align };
+  }
+
+  private alignCache = new Map<string, ReturnType<typeof detectAlignment>>();
+  detectedAlign(key: string, g: TextGroup) {
+    const k = key + '|' + g.id;
+    let a = this.alignCache.get(k);
+    if (!a) {
+      const s = this.sourceOf(key);
+      const box = s ? s.src.pageSize(s.index).box : [0, 0, 612, 792];
+      a = detectAlignment(g, this.groupsOf(key), { x: box[0], w: box[2] });
+      this.alignCache.set(k, a);
+    }
+    return a;
+  }
+
+  /** snap a dragged box (px rect r, moved by px/py) to the page centre and other lines; draws guides */
+  snapMove(v: PageView, key: string, r: { left: number; top: number; width: number; height: number }, px: number, py: number, self?: TextGroup): [number, number] {
+    const s = this.sourceOf(key);
+    const box = s ? s.src.pageSize(s.index).box : [0, 0, v.vp!.width / this.zoom, v.vp!.height / this.zoom];
+    const T = 6;
+    const xs: { x: number; kind: string }[] = [];
+    const ys: number[] = [];
+    if (v.page?.rotate === 0 || !v.page?.rotate) {
+      for (const t of snapTargets(this.groupsOf(key), self, { x: box[0], w: box[2] })) xs.push({ x: this.toPx(v, t.x, 0)[0], kind: t.kind });
+      for (const g of this.groupsOf(key)) if (g !== self) ys.push(this.toPx(v, 0, g.bbox.y0)[1]);
+      ys.push(this.toPx(v, 0, box[1] + box[3] / 2)[1]);
+    }
+    const nx = [r.left + px, r.left + r.width / 2 + px, r.left + r.width + px];
+    let bestX: { d: number; at: number; adj: number } | undefined;
+    for (const c of xs) for (const n of nx) {
+      const d = Math.abs(c.x - n);
+      if (d < T && (!bestX || d < bestX.d)) bestX = { d, at: c.x, adj: c.x - n };
+    }
+    const bottom = r.top + r.height + py;
+    let bestY: { d: number; at: number; adj: number } | undefined;
+    for (const y of ys) {
+      const d = Math.abs(y - bottom);
+      if (d < T && (!bestY || d < bestY.d)) bestY = { d, at: y, adj: y - bottom };
+    }
+    this.clearGuides(v);
+    if (bestX) { px += bestX.adj; v.layer.appendChild(h('div', { class: 'guide v', style: `left:${bestX.at}px` })); }
+    if (bestY) { py += bestY.adj; v.layer.appendChild(h('div', { class: 'guide h', style: `top:${bestY.at}px` })); }
+    return [px, py];
+  }
+  clearGuides(v: PageView) {
+    v.layer.querySelectorAll('.guide').forEach((g) => g.remove());
+  }
+
+  /** drag a side handle of a line's box */
+  startFrameResize(ev: PointerEvent, v: PageView, key: string, g: TextGroup, side: 'l' | 'r', frame: [number, number], el: HTMLElement) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    const tgt = ev.target as HTMLElement;
+    tgt.setPointerCapture(ev.pointerId);
+    const sx = ev.clientX;
+    const start = el.getBoundingClientRect();
+    const lr = v.layer.getBoundingClientRect();
+    let d = 0;
+    const move = (e: PointerEvent) => {
+      d = (e.clientX - sx) / this.zoom;
+      const w = Math.max(8 * this.zoom, start.width + (side === 'r' ? 1 : -1) * d * this.zoom);
+      el.style.width = w + 'px';
+      if (side === 'l') el.style.left = start.left - lr.left + d * this.zoom + 'px';
+    };
+    const up = () => {
+      tgt.removeEventListener('pointermove', move);
+      tgt.removeEventListener('pointerup', up);
+      if (Math.abs(d) < 0.2) return;
+      const nf: [number, number] = side === 'l' ? [Math.min(frame[0] + d, frame[1] - 8), frame[1]] : [frame[0], Math.max(frame[1] + d, frame[0] + 8)];
+      this.updateTextEdit(key, g.id, (x) => { x.frame = nf; });
+    };
+    tgt.addEventListener('pointermove', move);
+    tgt.addEventListener('pointerup', up);
+  }
+
+  /** arrow keys move the selection by 1pt (Shift: 10pt) */
+  nudge(arrow: string, pt: number) {
+    const s = this.selection;
+    if (!s) return;
+    const v = this.views.find((x) => x.slot.key === s.key);
+    if (!v?.vp) return;
+    const [ux, uy] = arrow === 'ArrowLeft' ? [-1, 0] : arrow === 'ArrowRight' ? [1, 0] : arrow === 'ArrowUp' ? [0, -1] : [0, 1];
+    const a = this.toPdf(v, 0, 0), b = this.toPdf(v, ux * pt * this.zoom, uy * pt * this.zoom);
+    const ddx = b[0] - a[0], ddy = b[1] - a[1];
+    const mk = `nudge|${s.kind}|${s.key}|${s.id}`;
+    if (s.kind === 'text') this.commit((st) => { const e = ((st.textEdits[s.key] ??= {})[s.id] ??= {}); e.dx = (e.dx ?? 0) + ddx; e.dy = (e.dy ?? 0) + ddy; }, { mergeKey: mk });
+    else if (s.kind === 'obj') this.commit((st) => { const e = ((st.xobjEdits[s.key] ??= {})[s.id] ??= {}); e.dx = (e.dx ?? 0) + ddx; e.dy = (e.dy ?? 0) + ddy; }, { mergeKey: mk });
+    else this.commit((st) => { const o = st.overlays[s.key]?.find((x) => x.id === s.id); if (o) moveOverlay(o, ddx, ddy); }, { mergeKey: mk });
+  }
+
+  toggleClean() {
+    this.viewer.classList.toggle('clean');
+    toast(this.viewer.classList.contains('clean') ? 'Clean view: exactly what will be exported (press G to toggle)' : 'Editing guides on');
+  }
+
+  /** move a line so its visual centre is on the page centre */
+  centreOnPage(key: string, g: TextGroup) {
+    const s = this.sourceOf(key);
+    if (!s) return;
+    const box = s.src.pageSize(s.index).box;
+    const e = this.state.textEdits[key]?.[g.id];
+    const lay = this.lineLayout(key, g, e);
+    const cx = lay.x0 + lay.w / 2 + (e?.dx ?? 0);
+    const want = box[0] + box[2] / 2;
+    this.updateTextEdit(key, g.id, (x) => { x.dx = (x.dx ?? 0) + (want - cx) || undefined; });
   }
 
   startResize(e: PointerEvent, v: PageView, o: Overlay, box: HTMLElement) {
@@ -1028,22 +1181,23 @@ export class App {
     if (!c) return '#fff';
     try {
       const k = c.width / v.el.clientWidth;
-      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      // copy the area around the box once, then sample its border
+      const x0 = Math.max(0, Math.floor((r.left - 4) * k)), y0 = Math.max(0, Math.floor((r.top - 4) * k));
+      const w = Math.max(1, Math.min(c.width - x0, Math.ceil((r.width + 8) * k))), hgt = Math.max(1, Math.min(c.height - y0, Math.ceil((r.height + 8) * k)));
+      const tmp = document.createElement('canvas');
+      tmp.width = w;
+      tmp.height = hgt;
+      const tc = tmp.getContext('2d', { willReadFrequently: true })!;
+      tc.drawImage(c, x0, y0, w, hgt, 0, 0, w, hgt);
+      const data = tc.getImageData(0, 0, w, hgt).data;
       const counts = new Map<string, number>();
-      const pts: [number, number][] = [];
-      for (let i = 0; i <= 16; i++) {
-        const x = r.left + (r.width * i) / 16;
-        pts.push([x, r.top - 2], [x, r.top + r.height + 2]);
-      }
-      for (let i = 0; i <= 6; i++) {
-        const y = r.top + (r.height * i) / 6;
-        pts.push([r.left - 3, y], [r.left + r.width + 3, y]);
-      }
-      for (const [x, y] of pts) {
-        const d = ctx.getImageData(Math.max(0, Math.round(x * k)), Math.max(0, Math.round(y * k)), 1, 1).data;
-        const key = `${d[0] >> 3},${d[1] >> 3},${d[2] >> 3}`;
+      const take = (x: number, y: number) => {
+        const i = (Math.min(hgt - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 4;
+        const key = `${data[i] >> 3},${data[i + 1] >> 3},${data[i + 2] >> 3}`;
         counts.set(key, (counts.get(key) ?? 0) + 1);
-      }
+      };
+      for (let i = 0; i <= 16; i++) { const x = Math.round((w * i) / 16); take(x, 1); take(x, hgt - 2); }
+      for (let i = 0; i <= 6; i++) { const y = Math.round((hgt * i) / 6); take(1, y); take(w - 2, y); }
       const best = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0].split(',').map((n) => (+n << 3) + 4);
       return `rgb(${best.join(',')})`;
     } catch {
@@ -1405,7 +1559,9 @@ export class App {
         rangeRow('Opacity', +(e.opacity ?? run.alpha).toFixed(2), 0, 1, 0.01, (n) => this.updateTextEdit(key, gid, (x) => { x.opacity = Math.abs(n - run.alpha) < 1e-3 ? undefined : n; }), true),
         h('div', { class: 'row' }, h('label', {}, 'Rotate°'), h('input', { type: 'number', step: '1', value: String(e.rotate ?? 0), onchange: (ev: Event) => { const v = parseFloat((ev.target as HTMLInputElement).value) || 0; this.updateTextEdit(key, gid, (x) => { x.rotate = v || undefined; }); } })),
         h('div', { class: 'hint', style: 'margin:-2px 0 8px' }, 'Untouched properties are inherited from the original – colour space, shade, transparency and layering stay exactly as they were.'),
-        h('div', { class: 'row' }, h('label', {}, 'Fit width'), h('input', { type: 'checkbox', checked: !!e.fit, onchange: (ev: Event) => this.updateTextEdit(key, gid, (x) => { x.fit = (ev.target as HTMLInputElement).checked || undefined; }) }), h('span', { class: 'hint' }, 'shrink longer text to the original width')),
+      ),
+      this.layoutSection(key, g, e),
+      h('div', { class: 'sec' }, h('h4', {}, 'Line behaviour'),
         h('div', { class: 'row' }, h('label', {}, 'Reflow'), h('input', { type: 'checkbox', checked: !e.noReflow, onchange: (ev: Event) => this.updateTextEdit(key, gid, (x) => { x.noReflow = (ev.target as HTMLInputElement).checked ? undefined : true; }) }), h('span', { class: 'hint' }, 'slide the rest of the line')),
       ),
       h('div', { class: 'sec' }, h('h4', {}, 'Font'),
@@ -1504,6 +1660,36 @@ export class App {
     }
   }
 
+  layoutSection(key: string, g: TextGroup, e: TextEdit) {
+    const det = this.detectedAlign(key, g);
+    const cur = e.align ?? 'auto';
+    const seg = (val: 'auto' | 'left' | 'center' | 'right', label: Node | string, title: string) =>
+      h('button', { class: `btn small${cur === val ? ' primary' : ''}`, title, onclick: () => this.updateTextEdit(key, g.id, (x) => { x.align = val === 'auto' ? undefined : val; }) }, label);
+    const flat = Math.abs(Math.sin(g.angle)) < 0.02;
+    const W0 = g.bbox.x1 - g.bbox.x0;
+    const fw = e.frame ? e.frame[1] - e.frame[0] : W0;
+    return h('div', { class: 'sec' }, h('h4', {}, 'Position & alignment'),
+      h('div', { class: 'btns', style: 'margin-bottom:6px' },
+        seg('auto', `Auto · ${{ left: 'left', center: 'centre', right: 'right' }[det.align]}`, `Keep the original alignment (${det.reason})`),
+        seg('left', icon('alignl'), 'Align left in the box'), seg('center', icon('alignc'), 'Centre in the box'), seg('right', icon('alignr'), 'Align right in the box')),
+      h('div', { class: 'hint', style: 'margin-bottom:8px' }, `Detected: ${det.reason}. When the text gets longer or shorter it stays ${{ left: 'left-aligned', center: 'centred', right: 'right-aligned' }[(e.align && e.align !== 'auto' ? e.align : det.align) as 'left']} in its box.`),
+      flat ? h('div', { class: 'row' }, h('label', {}, 'Box width'),
+        h('input', { type: 'number', step: '1', min: '8', value: fw.toFixed(1), onchange: (ev: Event) => {
+          const w = Math.max(8, parseFloat((ev.target as HTMLInputElement).value) || fw);
+          const c = e.frame ? (e.frame[0] + e.frame[1]) / 2 : W0 / 2;
+          // grow/shrink around the box's own alignment anchor
+          const al = e.align && e.align !== 'auto' ? e.align : det.align;
+          const nf: [number, number] = al === 'center' ? [c - w / 2, c + w / 2] : al === 'right' ? [(e.frame?.[1] ?? W0) - w, e.frame?.[1] ?? W0] : [e.frame?.[0] ?? 0, (e.frame?.[0] ?? 0) + w];
+          this.updateTextEdit(key, g.id, (x) => { x.frame = nf; });
+        } }), h('span', { class: 'muted' }, 'pt')) : '',
+      h('div', { class: 'row' }, h('label', {}, 'Fit box'), h('input', { type: 'checkbox', checked: !!e.fit, onchange: (ev: Event) => this.updateTextEdit(key, g.id, (x) => { x.fit = (ev.target as HTMLInputElement).checked || undefined; }) }), h('span', { class: 'hint' }, 'shrink text that is wider than its box')),
+      h('div', { class: 'btns' },
+        h('button', { class: 'btn small', onclick: () => this.centreOnPage(key, g) }, 'Centre on page'),
+        e.dx || e.dy ? h('button', { class: 'btn small', onclick: () => this.updateTextEdit(key, g.id, (x) => { x.dx = undefined; x.dy = undefined; }) }, 'Reset position') : null,
+        e.frame ? h('button', { class: 'btn small', onclick: () => this.updateTextEdit(key, g.id, (x) => { x.frame = undefined; }) }, 'Reset box') : null),
+      h('div', { class: 'hint', style: 'margin-top:8px' }, 'Drag the line to move it (it snaps to the page centre and other lines – hold Alt to move freely), drag the box handles to resize it, arrow keys nudge 1pt (Shift: 10pt).'));
+  }
+
   renderObjProps(key: string, id: string) {
     const xo = this.xobjectsOf(key).find((x) => x.id === id);
     if (!xo) return;
@@ -1566,6 +1752,7 @@ export class App {
     if (o.type !== 'redact' && o.type !== 'whiteout') sec.append(rangeRow('Opacity', o.opacity ?? (o.type === 'highlight' ? 0.45 : 1), 0.05, 1, 0.05, (n) => upd((t) => { t.opacity = n; }), true));
     sec.append(h('div', { class: 'btns', style: 'margin-top:8px' },
       h('button', { class: 'btn small', onclick: () => this.commit((s) => { const l = s.overlays[key]; const c = structuredClone(l.find((x) => x.id === o.id)!); c.id = uid('o'); moveOverlay(c, 10, -10); l.push(c); }) }, 'Duplicate'),
+      h('button', { class: 'btn small', onclick: () => { const src = this.sourceOf(key); const v = this.views.find((x) => x.slot.key === key); const bx = src ? src.src.pageSize(src.index).box : [0, 0, (v?.page?.view[2] ?? 612), 0]; this.commit((s) => { const t = s.overlays[key]?.find((x) => x.id === o.id); if (t) moveOverlay(t, bx[0] + bx[2] / 2 - (t.x + t.w / 2), 0); }); } }, 'Centre on page'),
       h('button', { class: 'btn small', onclick: () => this.commit((s) => { const l = s.overlays[key]; const i = l.findIndex((x) => x.id === o.id); l.push(...l.splice(i, 1)); }) }, 'Bring to front'),
       h('button', { class: 'btn small danger', onclick: () => this.deleteSelection() }, icon('trash'), 'Delete')));
     this.tabbody.append(sec);

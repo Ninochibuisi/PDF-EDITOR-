@@ -10,7 +10,7 @@
     "release": "npm run build && mkdir -p release && cp dist/index.html release/deep-pdf-editor.html",
     "preview": "vite preview",
     "fixtures": "node --experimental-strip-types tests/make-fixtures.ts",
-    "test": "node --experimental-strip-types tests/engine.test.ts && node --experimental-strip-types tests/stress.test.ts && node --experimental-strip-types tests/quality.test.ts && node --experimental-strip-types tests/symbols.test.ts && node --experimental-strip-types tests/fontmatch.test.ts"
+    "test": "node --experimental-strip-types tests/engine.test.ts && node --experimental-strip-types tests/stress.test.ts && node --experimental-strip-types tests/quality.test.ts && node --experimental-strip-types tests/symbols.test.ts && node --experimental-strip-types tests/fontmatch.test.ts && node --experimental-strip-types tests/layout.test.ts"
   },
   "dependencies": {
     "@pdf-lib/fontkit": "^1.1.1",

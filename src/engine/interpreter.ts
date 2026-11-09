@@ -263,7 +263,7 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
     const units: RunUnit[] = [];
     let pre: number[] = [];
     let adv = 0;
-    let minX = 0, maxX = 0;
+    let minX = Infinity, maxX = -Infinity;
     for (const it of items) {
       if (it.kind === 'num') {
         adv += (-it.value / 1000) * gs.fs * gs.Th;
@@ -280,12 +280,15 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
           glyphs.push(g);
           units.push({ kind: 'glyph', text: g.unicode, bytes: g.bytes, code: g.code, width: g.width, isSpace: g.isSpace, pre, tj: 0 });
           pre = [];
-          adv += ((g.width / 1000) * gs.fs + gs.Tc + (g.isSpace ? gs.Tw : 0)) * gs.Th;
+          const gw = ((g.width / 1000) * gs.fs + gs.Tc + (g.isSpace ? gs.Tw : 0)) * gs.Th;
+          // the box covers glyphs only (not kerning before/after them)
+          minX = Math.min(minX, adv, adv + gw);
+          maxX = Math.max(maxX, adv, adv + gw);
+          adv += gw;
         }
       }
-      minX = Math.min(minX, adv);
-      maxX = Math.max(maxX, adv);
     }
+    if (minX === Infinity) { minX = Math.min(0, adv); maxX = Math.max(0, adv); }
     tm = mul([1, 0, 0, 1, adv, 0], tm);
     const m = mul(startTm, gs.ctm);
     const top = gs.Ts + (font.ascent / 1000) * gs.fs;
@@ -470,7 +473,7 @@ export function groupRuns(runs: TextRun[]): TextGroup[] {
   };
   const unitsOf = (r: TextRun, idx: number): GroupUnit[] => r.units.map((u) => ({ ...u, run: idx }));
   for (const r of runs) {
-    if (r.glyphs.length === 0 && r.advance === 0) continue;
+    if (r.glyphs.length === 0) continue;
     const m = mul(r.tm, r.ctm);
     const dir = Math.atan2(m[1], m[0]);
     if (cur) {

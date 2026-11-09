@@ -81,3 +81,24 @@ console.log('quality fixtures ok');
   writeFileSync('tests/fixtures/notounicode.pdf', await d.save());
 }
 console.log('symbol fixtures ok');
+
+// certificate: centred title/name, right-aligned date, left-aligned body
+{
+  const d = await PDFDocument.create();
+  const p = d.addPage([842, 595]);
+  const hb = await d.embedFont(StandardFonts.HelveticaBold);
+  const hv = await d.embedFont(StandardFonts.Helvetica);
+  const centre = (t: string, y: number, size: number, f = hv) => p.drawText(t, { x: (842 - f.widthOfTextAtSize(t, size)) / 2, y, size, font: f });
+  centre('CERTIFICATE OF COMPLETION', 470, 30, hb);
+  centre('This certifies that', 420, 14);
+  centre('ADAEZE OKONKWO', 370, 28, hb);
+  p.drawLine({ start: { x: 271, y: 360 }, end: { x: 571, y: 360 }, thickness: 1, color: rgb(0.6, 0.6, 0.6) });
+  centre('has successfully completed the Advanced PDF Engineering programme', 330, 13);
+  const date = 'Lagos, 12 November 2026';
+  p.drawText(date, { x: 770 - hv.widthOfTextAtSize(date, 12), y: 120, size: 12, font: hv });
+  p.drawText('Signed: Registrar', { x: 770 - hv.widthOfTextAtSize('Signed: Registrar', 12), y: 100, size: 12, font: hv });
+  p.drawText('Reference: CERT-2026-0042', { x: 72, y: 120, size: 12, font: hv });
+  p.drawText('Verify at example.org/verify', { x: 72, y: 100, size: 12, font: hv });
+  writeFileSync('tests/fixtures/certificate.pdf', await d.save());
+}
+console.log('layout fixture ok');

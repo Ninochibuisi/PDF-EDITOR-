@@ -6,7 +6,7 @@ A PDF editor that runs entirely in the browser. It edits the real text inside a 
 npm install
 npm run dev        # develop at http://localhost:5173
 npm run release    # → release/deep-pdf-editor.html (single file, works offline, double-click to open)
-npm test           # engine round-trip, stress, quality and symbol tests (Node 22+; pixel checks use poppler if installed)
+npm test           # engine round-trip, stress, quality, symbol, font-matching and layout tests (Node 22+; pixel checks use poppler if installed)
 ```
 
 ## What it does
@@ -18,6 +18,7 @@ npm test           # engine round-trip, stress, quality and symbol tests (Node 2
 | **Smart scan** | Every page is analysed in the background: text lines, fonts, images, watermarks, scanned (image-only) pages, and hidden OCR text layers. |
 | **Watermark studio** | Detects tagged watermark artifacts, Adobe Acrobat watermarks, `/Watermark` annotations, and untagged look-alikes (diagonal, translucent, repeated, "CONFIDENTIAL"/"DRAFT"…). For each one you can **re-text it in place in its own font**, change its opacity, colour, size or angle across every page, remove it, or replace it. You can also add text or image watermarks (centred, tiled or in corners, over or behind content, on page ranges like `1-3, odd`). Added watermarks are tagged as standard PDF watermark artifacts, so they stay editable after the file is re-opened. |
 | **Symbol-safe, minimal-change editing** | Edits are diffed glyph by glyph: every character you didn't change (₦ $ € £ ¥ © ® ™, ligatures, glyphs with no Unicode mapping) keeps its **exact original bytes, font, colour and position**. New characters are drawn first from the run's own font, then from other subsets of the same typeface anywhere in the document. Only a character that exists in none of them falls back to a style-matched font, and only that one character does. A bundled DejaVu subset covers currency and symbols such as ₦ ₵ ₹ that standard PDF fonts can't draw. Embedded font programs (TrueType, CFF, Type 1) are read to check which glyphs really exist, and to decode symbols in fonts without a ToUnicode map. A line can mix fonts, weights and colours; each run keeps its own. |
+| **Layout & alignment** | Each line's original alignment is detected: centred on the page or in its box, right-aligned with other lines, or left-aligned. Edits keep it, so a centred name stays centred however long it gets. You can drag lines with snap guides (page centre, other lines' edges, centres and baselines; hold Alt to move freely), nudge with the arrow keys (1 pt, Shift for 10 pt), resize a line's box with its side handles without scaling the text, and set Left / Centre / Right / Auto alignment, "Fit box" or "Centre on page". **Clean view** (G) hides every editing guide so you see exactly what will be exported. |
 | **Edit existing text** | Click any line to retype it. The new text is re-encoded into the PDF's content stream using the **original embedded font** (Type1, TrueType, CID/Type0, Type3, CJK). The rest of the line reflows. You can also move, resize, recolour or delete lines. |
 | **Find & replace** | Searches the whole document and writes replacements back into the original text runs. |
 | **Images & objects** | Move, delete or replace embedded images and vector form objects. |

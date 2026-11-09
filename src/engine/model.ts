@@ -29,8 +29,12 @@ export interface TextEdit {
   opacity?: number;
   /** extra rotation in degrees (counter-clockwise) around the start of the baseline */
   rotate?: number;
-  /** shrink the line so it never gets wider than the original */
+  /** shrink the line so it never gets wider than its box */
   fit?: boolean;
+  /** alignment inside the line's box; 'auto' (default) keeps the alignment detected in the original */
+  align?: 'auto' | 'left' | 'center' | 'right';
+  /** the line's box along the baseline, in points relative to the original start: [start, end] */
+  frame?: [number, number];
 }
 
 export interface XObjectEdit {

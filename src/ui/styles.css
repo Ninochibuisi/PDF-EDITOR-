@@ -71,9 +71,18 @@ svg.i { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-widt
 
 /* hit boxes */
 .hit { position: absolute; border-radius: 2px; }
-.mode-edittext .hit.text { cursor: text; outline: 1px dashed #7c5cff55; }
-.mode-edittext .hit.text:hover { background: #7c5cff22; outline: 1.5px solid var(--accent); }
-.hit.text.edited { outline: 1px solid #3ecf8e88 !important; }
+.mode-edittext .hit.text { cursor: text; }
+.mode-edittext .hit.text:hover { background: #7c5cff14; outline: 1.5px solid var(--accent); }
+.mode-edittext .hit.text.edited:not(:hover):not(.selected) { box-shadow: inset 0 -2px 0 #3ecf8e99; }
+.frame { position: absolute; border: 1px dashed #7c5cffaa; border-radius: 3px; pointer-events: none; z-index: 6; }
+.frame-tag { position: absolute; top: -17px; right: 0; font-size: 10px; background: var(--accent); color: #fff; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
+.fhandle { position: absolute; top: 50%; width: 8px; height: 22px; margin-top: -11px; background: #fff; border: 2px solid var(--accent); border-radius: 3px; cursor: ew-resize; pointer-events: auto; }
+.fhandle.l { left: -5px; } .fhandle.r { right: -5px; }
+.guide { position: absolute; background: #ff3d8b; pointer-events: none; z-index: 30; }
+.guide.v { top: 0; bottom: 0; width: 1px; }
+.guide.h { left: 0; right: 0; height: 1px; }
+.viewer.clean .layer .hit, .viewer.clean .layer .hit.selected, .viewer.clean .frame, .viewer.clean .plabel { outline: none !important; background: none !important; box-shadow: none !important; border-color: transparent !important; }
+.viewer.clean .frame, .viewer.clean .handle, .viewer.clean .fhandle { display: none; }
 .hit.text.selected { background: transparent !important; }
 .hit.text.selected, .hit.obj.selected, .hit.ov.selected { outline: 2px solid var(--accent) !important; background: #7c5cff14; }
 .mode-objects .hit.obj { cursor: move; outline: 1px dashed #4fd1ff88; }

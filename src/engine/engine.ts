@@ -30,6 +30,7 @@ import fontkit from '@pdf-lib/fontkit';
 import { Encodings } from '@pdf-lib/standard-fonts';
 import { FontCache, type PdfFont } from './fonts.ts';
 import { planLine, type FontSlot, type Piece, type FallbackPrefs } from './textedit.ts';
+import { detectAlignment } from './layout.ts';
 import { parseFontProgram } from './fontprog.ts';
 
 /** Coverage check for uploaded / fetched fallback fonts (`asset:<id>`), cached per asset. */
@@ -538,6 +539,37 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
   const shifts = new Map<string, [number, number]>();
   const pool = bc.pool;
 
+  /** how much each run's width changes (user units along the line), with the same rules used when writing */
+  const runDeltas = async (lp: ReturnType<typeof planLine>) => {
+    const out: number[] = [];
+    for (let i = 0; i < lp.runs.length; i++) {
+      const rp = lp.runs[i];
+      const run = rp.run;
+      if (!rp.changed) { out.push(0); continue; }
+      const newAdv = await piecesAdvance(run, rp.pieces);
+      const lin = mul(run.tm, run.ctm);
+      let d = (newAdv - run.advance) * Math.hypot(lin[0], lin[1]) - rp.gapRemoved;
+      const next = lp.runs[i + 1]?.run;
+      if (!rp.pieces.some((pc) => pc.items.some((it) => typeof it !== 'number') || pc.text) && next) {
+        const [dx, dy] = unitDir(run);
+        const a0 = apply(mul(run.tm, run.ctm), 0, 0), b0 = apply(mul(next.tm, next.ctm), 0, 0);
+        d = -((b0[0] - a0[0]) * dx + (b0[1] - a0[1]) * dy) - rp.gapRemoved;
+      }
+      out.push(d);
+    }
+    return out;
+  };
+  /** original visual width of a line (user units along its baseline) */
+  const lineWidth = (group: TextGroup) => {
+    const base = group.runs[0];
+    const m = mul(base.tm, base.ctm);
+    const inv = invert(m);
+    let endX = 0;
+    for (const r of group.runs) endX = Math.max(endX, apply(inv, ...apply(mul(r.tm, r.ctm), r.advance, 0))[0]);
+    return endX * Math.hypot(m[0], m[1]);
+  };
+  const pageBox = page.getCropBox();
+
   /** would the run, drawn from text-space x0 to x1 (optionally through userM), leave its clipping box? */
   const overflows = (run: TextRun, x0: number, x1: number, userM?: Matrix) => {
     const c = run.clip;
@@ -578,19 +610,30 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
         w0 += rp.run.advance * k;
         w1 += (rp.changed ? await piecesAdvance(rp.run, rp.pieces) : rp.run.advance) * k - rp.gapRemoved;
       }
+      if (edit.frame) w0 = Math.max(1, edit.frame[1] - edit.frame[0]);
       if (w1 > w0 * 1.001 && w1 > 0) edit = { ...edit, scale: (edit.scale ?? 1) * (w0 / w1) };
     }
     const lp = planLine(group, edit, pool, fallbackPrefs(state, bc.assets));
     const base = group.runs[0];
     const reflow = !edit.noReflow && !(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1));
 
+    // alignment: where the edited line starts inside its box (keeps centred / right-aligned text in place)
+    const deltas = await runDeltas(lp);
+    const W0 = lineWidth(group);
+    const W1 = (W0 + deltas.reduce((a, b) => a + b, 0)) * (edit.scale ?? 1);
+    const align = edit.align && edit.align !== 'auto' ? edit.align : detectAlignment(group, model.groups, { x: pageBox.x, w: pageBox.width }).align;
+    const frame = edit.frame ?? [0, W0];
+    const startOff = edit.noReflow ? 0 : align === 'center' ? (frame[0] + frame[1]) / 2 - W1 / 2 : align === 'right' ? frame[1] - W1 : frame[0];
+    const [bdx, bdy] = unitDir(base);
+    const S0: [number, number] = Math.abs(startOff) > 0.005 ? [bdx * startOff, bdy * startOff] : [0, 0];
+
     if (!lp.restyle) {
       // in place: changed runs are rewritten inside their own operator (own font, colour and state);
       // their end point is restored so nothing else moves implicitly, and following runs slide explicitly
-      let S: [number, number] = [0, 0];
+      let S: [number, number] = S0;
       for (const rp of lp.runs) {
         const run = rp.run;
-        const lead = reflow && (S[0] || S[1]) ? kernFor(run, textSpaceShift(run, S)) : 0;
+        const lead = (reflow || S0[0] || S0[1]) && (S[0] || S[1]) ? kernFor(run, textSpaceShift(run, S)) : 0;
         if (rp.changed) {
           const newAdv = await piecesAdvance(run, rp.pieces);
           const leadDisp = (-lead / 1000) * run.fs * run.Th;
@@ -654,7 +697,7 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
 
     // restyled (moved / scaled / rotated / recoloured / opacity / forced fallback):
     // every run is hidden and redrawn at its own spot in the stream, inheriting its own state
-    let userM: Matrix = [1, 0, 0, 1, edit.dx ?? 0, edit.dy ?? 0];
+    let userM: Matrix = [1, 0, 0, 1, (edit.dx ?? 0) + S0[0], (edit.dy ?? 0) + S0[1]];
     const [px, py] = apply(mul(base.tm, base.ctm), 0, 0);
     const sc = edit.scale ?? 1;
     const a = ((edit.rotate ?? 0) * Math.PI) / 180;
