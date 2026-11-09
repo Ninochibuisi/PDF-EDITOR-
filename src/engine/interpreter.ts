@@ -126,6 +126,13 @@ export interface MarkedBlock {
   label: string;
 }
 
+export interface Paint {
+  stream: number;
+  opIndex: number;
+  bbox: BBox;
+  kind: 'fill' | 'stroke' | 'image';
+}
+
 export interface WatermarkAnnot {
   id: string;
   ref: string;
@@ -161,6 +168,8 @@ export interface PageModel {
   groups: TextGroup[];
   blocks: MarkedBlock[];
   annots: WatermarkAnnot[];
+  /** everything painted on the page (fills, strokes, images) in content order */
+  paints: Paint[];
 }
 
 export interface TextGroup {
@@ -191,6 +200,7 @@ interface GState {
   fs: number;
   alpha: number;
   clip?: BBox;
+  lw: number;
 }
 
 const num = (o: Operand | undefined) => (o && o.kind === 'num' ? o.value : 0);
@@ -229,11 +239,12 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
 
   let gs: GState = {
     ctm: IDENTITY, fill: { op: 'g', comps: [0] }, fillCS: 'DeviceGray',
-    Tc: 0, Tw: 0, Th: 1, TL: 0, Ts: 0, Tr: 0, fontKey: '', fs: 0, alpha: 1,
+    Tc: 0, Tw: 0, Th: 1, TL: 0, Ts: 0, Tr: 0, fontKey: '', fs: 0, alpha: 1, lw: 1,
   };
   const gsDict = getDict(ctx, resources, 'ExtGState');
   const propDict = getDict(ctx, resources, 'Properties');
   const blocks: MarkedBlock[] = [];
+  const paints: Paint[] = [];
   const mcStack: { wm: boolean; s: number; i: number; start: number; label: string }[] = [];
   // current path bounds (user space) – used to know the clipping box
   let pathBox: BBox | undefined;
@@ -317,7 +328,14 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
           break;
         }
         case 'W': case 'W*': pendingClip = true; break;
+        case 'w': gs.lw = num(a[0]); break;
         case 'n': case 'f': case 'F': case 'f*': case 'S': case 's': case 'B': case 'B*': case 'b': case 'b*': {
+          if (op.op !== 'n' && pathBox) {
+            const stroke = op.op === 'S' || op.op === 's' || op.op.startsWith('B') || op.op.startsWith('b');
+            // half the stroke width, scaled to user space
+            const hw = stroke ? (Math.max(gs.lw, 0.5) * Math.hypot(gs.ctm[0], gs.ctm[1])) / 2 : 0;
+            paints.push({ stream: s, opIndex: i, kind: stroke && !op.op.startsWith('B') && !op.op.startsWith('b') ? 'stroke' : 'fill', bbox: { x0: pathBox.x0 - hw, y0: pathBox.y0 - hw, x1: pathBox.x1 + hw, y1: pathBox.y1 + hw } });
+          }
           if (pendingClip && pathBox) {
             const c = gs.clip;
             gs.clip = c ? { x0: Math.max(c.x0, pathBox.x0), y0: Math.max(c.y0, pathBox.y0), x1: Math.min(c.x1, pathBox.x1), y1: Math.min(c.y1, pathBox.y1) } : { ...pathBox };
@@ -451,7 +469,8 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
       annots.push({ id: `annot:${ref}`, ref, rect: { x0: Math.min(r[0], r[2]), y0: Math.min(r[1], r[3]), x1: Math.max(r[0], r[2]), y1: Math.max(r[1], r[3]) } });
     }
   }
-  return { streams, runs, xobjects, groups: groupRuns(runs), blocks, annots };
+  for (const x of xobjects) paints.push({ stream: x.stream, opIndex: x.opIndex, bbox: x.bbox, kind: 'image' });
+  return { streams, runs, xobjects, groups: groupRuns(runs), blocks, annots, paints };
 }
 
 /**

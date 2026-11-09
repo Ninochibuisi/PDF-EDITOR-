@@ -50,7 +50,7 @@ export function fallbackPrefs(state: EditorState, assets: Map<string, Asset>): F
     },
   };
 }
-import { interpretPage, mul, apply, invert, IDENTITY, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
+import { interpretPage, mul, apply, invert, IDENTITY, type BBox, type Matrix, type PageModel, type TextGroup, type TextRun, type XObjectRun, type FillColor } from './interpreter.ts';
 import { fmtNum, hexString, latin1, nameToken, type Operand } from './lexer.ts';
 import type { Asset, EditorState, Overlay, RGB, TextEdit, Watermark } from './model.ts';
 import { resolve } from './pdfobj.ts';
@@ -86,7 +86,7 @@ export class SourceDoc {
         m = interpretPage(this.doc, i, this.fonts);
       } catch (e) {
         console.warn('interpret failed', e);
-        m = { streams: [], runs: [], xobjects: [], groups: [], blocks: [], annots: [] };
+        m = { streams: [], runs: [], xobjects: [], groups: [], blocks: [], annots: [], paints: [] };
       }
       this.models.set(i, m);
     }
@@ -570,17 +570,41 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
   };
   const pageBox = page.getCropBox();
 
-  /** would the run, drawn from text-space x0 to x1 (optionally through userM), leave its clipping box? */
-  const overflows = (run: TextRun, x0: number, x1: number, userM?: Matrix) => {
-    const c = run.clip;
-    if (!c) return false;
+  /** glyph box of a run drawn from text-space x0 to x1 (optionally moved through userM), in user space */
+  const glyphBox = (run: TextRun, x0: number, x1: number, userM?: Matrix): BBox => {
     let m = mul(run.tm, run.ctm);
-    const mid = run.Ts + ((run.font.ascent + run.font.descent) / 2000) * run.fs;
-    const out = (p: [number, number]) => p[0] < c.x0 - 0.5 || p[0] > c.x1 + 0.5 || p[1] < c.y0 - 0.5 || p[1] > c.y1 + 0.5;
-    // only when the original sat inside its clip (a deliberately cropped text stays cropped)
-    if (out(apply(m, 0, mid)) || out(apply(m, run.advance, mid))) return false;
     if (userM) m = mul(m, userM);
-    return out(apply(m, x0, mid)) || out(apply(m, x1, mid));
+    const top = run.Ts + (run.font.ascent / 1000) * run.fs, bot = run.Ts + (run.font.descent / 1000) * run.fs;
+    const pts = [apply(m, x0, bot), apply(m, x1, bot), apply(m, x1, top), apply(m, x0, top)];
+    return { x0: Math.min(...pts.map((p) => p[0])), y0: Math.min(...pts.map((p) => p[1])), x1: Math.max(...pts.map((p) => p[0])), y1: Math.max(...pts.map((p) => p[1])) };
+  };
+  const overlapArea = (a: BBox, b: BBox) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+  /**
+   * Must the edited run be drawn on top of the page instead of in place? True when, at its new size/position,
+   *  - it would be cut by its clipping box on a side the original stayed inside of, or
+   *  - it would slide under something painted after it (a white bar, a rule, a box background…) that it
+   *    didn't overlap before – that later paint would rub out part of the letters.
+   */
+  const overflows = (run: TextRun, x0: number, x1: number, userM?: Matrix) => {
+    const ob = glyphBox(run, 0, run.advance);
+    const nb = glyphBox(run, x0, x1, userM);
+    const c = run.clip;
+    if (c) {
+      const t = 0.5;
+      if (ob.x0 >= c.x0 - t && nb.x0 < c.x0 - t) return true;
+      if (ob.x1 <= c.x1 + t && nb.x1 > c.x1 + t) return true;
+      if (ob.y0 >= c.y0 - t && nb.y0 < c.y0 - t) return true;
+      if (ob.y1 <= c.y1 + t && nb.y1 > c.y1 + t) return true;
+    }
+    const area = Math.max(1e-6, (nb.x1 - nb.x0) * (nb.y1 - nb.y0));
+    for (const p of model.paints) {
+      if (p.stream < run.stream || (p.stream === run.stream && p.opIndex <= run.opIndex)) continue;
+      const pa = (p.bbox.x1 - p.bbox.x0) * (p.bbox.y1 - p.bbox.y0);
+      if (pa > 0.6 * pageBox.width * pageBox.height) continue; // full-page layers covered the original too
+      const now = overlapArea(nb, p.bbox), before = overlapArea(ob, p.bbox);
+      if (now - before > 0.004 * area + 0.05) return true;
+    }
+    return false;
   };
   /**
    * Text that would be cut off by its clipping box (e.g. a web page's overflow:hidden container)

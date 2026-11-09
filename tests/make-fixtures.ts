@@ -102,3 +102,19 @@ console.log('symbol fixtures ok');
   writeFileSync('tests/fixtures/certificate.pdf', await d.save());
 }
 console.log('layout fixture ok');
+
+// occlusion: shapes painted AFTER the text (white panel to the right, rule above) – edits must not slide under them
+{
+  const d = await PDFDocument.create();
+  const p = d.addPage([600, 300]);
+  const hb = await d.embedFont(StandardFonts.HelveticaBold);
+  p.drawRectangle({ x: 0, y: 0, width: 600, height: 300, color: rgb(0.93, 0.95, 1) });
+  const t = 'ADAEZE OKONKWO';
+  const w = hb.widthOfTextAtSize(t, 24);
+  p.drawText(t, { x: (600 - w) / 2, y: 150, size: 24, font: hb, color: rgb(0.1, 0.1, 0.1) });
+  // painted after the text: a white panel starting just right of it, and a rule just above it
+  p.drawRectangle({ x: (600 + w) / 2 + 6, y: 120, width: 120, height: 70, color: rgb(1, 1, 1) });
+  p.drawLine({ start: { x: 150, y: 175 }, end: { x: 450, y: 175 }, thickness: 3, color: rgb(1, 1, 1) });
+  writeFileSync('tests/fixtures/occlude.pdf', await d.save());
+}
+console.log('occlusion fixture ok');

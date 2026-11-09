@@ -716,7 +716,7 @@ export class App {
           const off = lay.x0 - g.bbox.x0;
           const shown: [number, number] = e?.frame ? lay.frame : [Math.min(lay.frame[0], off), Math.max(lay.frame[1], off + lay.w)];
           const fr = this.rectPx(v, g.bbox.x0 + shown[0] + dx, g.bbox.y0 + dy, g.bbox.x0 + shown[1] + dx, g.bbox.y1 + dy);
-          const frameEl = h('div', { class: 'frame', style: `left:${fr.left - 3}px;top:${fr.top - 4}px;width:${fr.width + 6}px;height:${fr.height + 8}px` },
+          const frameEl = h('div', { class: 'frame', style: `left:${fr.left - 7}px;top:${fr.top - 7}px;width:${fr.width + 14}px;height:${fr.height + 14}px` },
             h('span', { class: 'frame-tag' }, `${{ left: 'Left', center: 'Centre', right: 'Right' }[lay.align]}${!e?.align || e.align === 'auto' ? ' (auto)' : ''}`));
           for (const side of ['l', 'r'] as const) {
             const hd = h('div', { class: `fhandle ${side}`, title: 'Drag to resize the text box' });

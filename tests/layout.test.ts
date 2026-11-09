@@ -60,5 +60,43 @@ console.log('\nboxes and manual alignment');
   const mv = await edited('ADAEZE', { dx: 30, dy: -12 });
   check(Math.abs(mv.bbox.x0 - g.bbox.x0 - 30) < 0.6 && Math.abs(mv.bbox.y0 - g.bbox.y0 + 12) < 0.6, 'moved text lands exactly where dragged');
 }
+console.log('\nnothing painted after the text may rub out an edit');
+{
+  const { execFileSync } = await import('node:child_process');
+  const { writeFileSync } = await import('node:fs');
+  const oc = await SourceDoc.open({ id: 's0', name: 'o', bytes: new Uint8Array(readFileSync('tests/fixtures/occlude.pdf')) });
+  const g = oc.model(0).groups.find((x) => x.text.includes('ADAEZE'))!;
+  const darkIn = (bytes: Uint8Array, r: { x0: number; y0: number; x1: number; y1: number }, name: string) => {
+    writeFileSync(`tests/out/${name}.pdf`, bytes);
+    execFileSync('pdftoppm', ['-r', '72', '-gray', '-singlefile', `tests/out/${name}.pdf`, `tests/out/${name}`]);
+    const buf = readFileSync(`tests/out/${name}.pgm`);
+    const hdr = buf.subarray(0, 20).toString('latin1').split(/\s+/);
+    const W = +hdr[1], H = +hdr[2], off = buf.length - W * H;
+    let n = 0;
+    for (let y = Math.floor(300 - r.y1); y < Math.ceil(300 - r.y0); y++) for (let x = Math.floor(r.x0); x < Math.ceil(r.x1); x++) if (buf[off + y * W + x] < 90) n++;
+    return n;
+  };
+  const build = async (e: TextEdit) => {
+    const st = emptyState();
+    st.pages = [{ key: 's0:0', rotate: 0 }];
+    st.textEdits['s0:0'] = { [g.id]: e };
+    return buildPdf(new Map([['s0', oc]]), 's0', st, new Map());
+  };
+  let hasPop = true;
+  try { execFileSync('pdftoppm', ['-v'], { stdio: 'ignore' }); } catch { hasPop = false; }
+  if (hasPop) {
+    // longer, still centred: the right end now reaches under the white panel
+    const longer = await build({ text: 'OLUWAYEMISI ARIGBEDE ADEYEMI' });
+    const panel = { x0: (600 + (g.bbox.x1 - g.bbox.x0)) / 2 + 8, y0: g.bbox.y0 + 2, x1: (600 + (g.bbox.x1 - g.bbox.x0)) / 2 + 120, y1: g.bbox.y1 - 2 };
+    check(darkIn(longer, panel, 'occ_long') > 40, 'longer name is NOT rubbed out by the white panel painted after it');
+    // bigger: the tops of the letters now reach the white rule painted after it
+    const bigger = await build({ scale: 1.5 });
+    const rule = { x0: g.bbox.x0 + 4, y0: 173.6, x1: g.bbox.x0 + 160, y1: 176.4 };
+    check(darkIn(bigger, rule, 'occ_big') > 20, 'enlarged name is NOT cut by the white rule painted after it');
+    const plain = await build({ text: 'ADA OKONKWO' });
+    check(darkIn(plain, rule, 'occ_plain') === 0, 'a shorter name stays in place (no needless redraw on top)');
+  }
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nlayout passed');
 process.exit(failures ? 1 : 0);
