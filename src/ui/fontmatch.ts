@@ -153,3 +153,38 @@ export async function downloadMatch(fontName: string, need: string[]): Promise<{
   }
   return { parts: [] };
 }
+
+// ---------------------------------------------------------------- on-screen editor fonts
+const WEIGHTS_TRY = (w: number) => [...new Set([w, w >= 600 ? 700 : 400, 400, 500, 700])];
+const loadedFaces = new Map<string, Promise<void>>();
+
+/** CSS font-family list for the inline editor: the real face (fetched & cached) first, then installed/generic. */
+export function editorFontFamily(fontName: string, generic: string): string {
+  const { weight, italic } = parseFontName(fontName);
+  const fams: string[] = [];
+  for (const c of candidatesFor(fontName)) {
+    const fam = `dpe-${c.id}-${weight}${italic ? 'i' : ''}`;
+    fams.push(`"${fam}"`);
+    if (!loadedFaces.has(fam)) loadedFaces.set(fam, loadFace(fam, c.id, weight, italic));
+  }
+  const { family } = parseFontName(fontName);
+  return [...fams, `"${spaced(family)}"`, `"${family}"`, generic].join(', ');
+}
+
+async function loadFace(fam: string, id: string, weight: number, italic: boolean) {
+  for (const w of WEIGHTS_TRY(weight)) {
+    const bytes = await fetchFont(`https://cdn.jsdelivr.net/fontsource/fonts/${id}@latest/latin-${w}-${italic ? 'italic' : 'normal'}.ttf`);
+    if (!bytes) continue;
+    try {
+      const ff = new FontFace(fam, bytes as BufferSource);
+      await ff.load();
+      document.fonts.add(ff);
+    } catch { /* unusable font */ }
+    return;
+  }
+}
+
+export function cssWeight(fontName: string, bold: boolean): number {
+  const w = parseFontName(fontName).weight;
+  return bold && w < 600 ? 700 : w;
+}

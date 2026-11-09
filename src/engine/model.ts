@@ -29,6 +29,8 @@ export interface TextEdit {
   opacity?: number;
   /** extra rotation in degrees (counter-clockwise) around the start of the baseline */
   rotate?: number;
+  /** shrink the line so it never gets wider than the original */
+  fit?: boolean;
 }
 
 export interface XObjectEdit {

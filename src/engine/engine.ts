@@ -481,15 +481,104 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
     return s.trim() || '[] TJ';
   };
 
+  /**
+   * Type 3 fonts: viewers disagree on how TJ kerning is scaled for them (poppler applies the font
+   * matrix), so every glyph is placed with an explicit text matrix instead – identical in all viewers.
+   * Only valid inside a text object we opened ourselves.
+   */
+  const placedOps = async (run: TextRun, pieces: Piece[], lead: number) => {
+    let s = '';
+    let cur = run.fontKey;
+    let x = (-lead / 1000) * run.fs * run.Th;
+    const at = () => `${mat(mul([1, 0, 0, 1, x, 0], run.tm))} Tm `;
+    for (const pc of pieces) {
+      const k = await slotKey(pc.slot);
+      if (k !== cur) {
+        s += `${nameToken(k)} ${fmtNum(run.fs)} Tf `;
+        cur = k;
+      }
+      if (pc.slot.kind === 'lib') {
+        const lf = libKeys.get(pc.slot.name)!.font;
+        const txt = libClean(lf, pc.text);
+        s += at() + `${lf.encodeText(txt).toString()} Tj `;
+        x += (lf.widthOfTextAtSize(txt, run.fs) + Array.from(txt).length * run.Tc) * run.Th;
+        continue;
+      }
+      const f = pc.slot.font;
+      for (const it of pc.items) {
+        if (typeof it === 'number') { x += (-it / 1000) * run.fs * run.Th; continue; }
+        for (const g of f.decode(it)) {
+          s += at() + `${hexString(g.bytes)} Tj `;
+          x += ((g.width / 1000) * run.fs + run.Tc + (g.isSpace ? run.Tw : 0)) * run.Th;
+        }
+      }
+    }
+    if (cur !== run.fontKey) s += `${nameToken(run.fontKey)} ${fmtNum(run.fs)} Tf `;
+    return s.trim();
+  };
+  const isT3 = (run: TextRun, pieces: Piece[]) => run.font.isType3 || pieces.some((pc) => pc.slot.kind !== 'lib' && pc.slot.font.isType3);
+  /** state needed to continue the original text object after we closed it */
+  const restoreAfter = (run: TextRun) => {
+    const tmAfter = mul([1, 0, 0, 1, run.advance, 0], run.tm);
+    const R = mul(tmAfter, invert(run.tlm));
+    if (Math.abs(R[0] - 1) + Math.abs(R[1]) + Math.abs(R[2]) + Math.abs(R[3] - 1) + Math.abs(R[5]) < 1e-6) {
+      const k = kernFor(run, R[4]);
+      return `${mat(run.tlm)} Tm` + (Math.abs(k) > 1e-6 ? ` [${fmtNum(k)}] TJ` : '');
+    }
+    return `${mat(tmAfter)} Tm`;
+  };
+  /** hide the run and redraw it at the same place in the stream inside its own state */
+  const inlineRedraw = (run: TextRun, show: string, pre = '') => {
+    patch(run, hideRun(run));
+    const prev = patches.get(run.stream)!.find((p) => p.start === run.start)!;
+    prev.text += ` ET q ${pre}BT ${mat(run.tm)} Tm ${show} ET Q BT ${restoreAfter(run)}`;
+  };
+  const own = (run: TextRun): Piece[] => [{ slot: { kind: 'orig', key: run.fontKey, font: run.font }, items: run.items, text: '', glyphs: [] }];
+
   const shifts = new Map<string, [number, number]>();
   const pool = bc.pool;
+
+  /** would the run, drawn from text-space x0 to x1 (optionally through userM), leave its clipping box? */
+  const overflows = (run: TextRun, x0: number, x1: number, userM?: Matrix) => {
+    const c = run.clip;
+    if (!c) return false;
+    let m = mul(run.tm, run.ctm);
+    const mid = run.Ts + ((run.font.ascent + run.font.descent) / 2000) * run.fs;
+    const out = (p: [number, number]) => p[0] < c.x0 - 0.5 || p[0] > c.x1 + 0.5 || p[1] < c.y0 - 0.5 || p[1] > c.y1 + 0.5;
+    // only when the original sat inside its clip (a deliberately cropped text stays cropped)
+    if (out(apply(m, 0, mid)) || out(apply(m, run.advance, mid))) return false;
+    if (userM) m = mul(m, userM);
+    return out(apply(m, x0, mid)) || out(apply(m, x1, mid));
+  };
+  /**
+   * Text that would be cut off by its clipping box (e.g. a web page's overflow:hidden container)
+   * is drawn after the page content, outside the clip, with its exact colour and opacity.
+   */
+  const escapeRun = (run: TextRun, show: string, userM?: Matrix, color?: string, gsOp = '') => {
+    patch(run, hideRun(run));
+    const alpha = !gsOp && run.alpha < 1 ? `${nameToken(alphaGs(run.alpha))} gs ` : gsOp;
+    append += `q ${alpha}${userM ? mat(userM) + ' cm ' : ''}${mat(run.ctm)} cm BT ${nameToken(run.fontKey)} ${fmtNum(run.fs)} Tf ${fmtNum(run.Tc)} Tc ${fmtNum(run.Tw)} Tw ${fmtNum(run.Th * 100)} Tz ${fmtNum(run.Ts)} Ts ${fmtNum(run.Tr)} Tr ${color ?? colorOps(run.color)} ${mat(run.tm)} Tm ${show} ET Q\n`;
+  };
+
   for (const gid in tEdits) {
-    const edit = tEdits[gid];
+    let edit = tEdits[gid];
     const group = model.groups.find((g) => g.id === gid);
     if (!group) continue;
     if (edit.deleted) {
       for (const r of group.runs) patch(r, hideRun(r));
       continue;
+    }
+    if (edit.fit) {
+      // shrink to the original line width (anchored at the start of the line)
+      const lp0 = planLine(group, { ...edit, fit: undefined }, pool, fallbackPrefs(state, bc.assets));
+      let w0 = 0, w1 = 0;
+      for (const rp of lp0.runs) {
+        const lin = mul(rp.run.tm, rp.run.ctm);
+        const k = Math.hypot(lin[0], lin[1]);
+        w0 += rp.run.advance * k;
+        w1 += (rp.changed ? await piecesAdvance(rp.run, rp.pieces) : rp.run.advance) * k - rp.gapRemoved;
+      }
+      if (w1 > w0 * 1.001 && w1 > 0) edit = { ...edit, scale: (edit.scale ?? 1) * (w0 / w1) };
     }
     const lp = planLine(group, edit, pool, fallbackPrefs(state, bc.assets));
     const base = group.runs[0];
@@ -506,16 +595,33 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
           const newAdv = await piecesAdvance(run, rp.pieces);
           const leadDisp = (-lead / 1000) * run.fs * run.Th;
           const tail = kernFor(run, run.advance - newAdv - leadDisp);
-          patch(run, opPrefix(run) + (await piecesOps(run, rp.pieces, lead, tail)));
+          if (isT3(run, rp.pieces)) {
+            const show = await placedOps(run, rp.pieces, lead);
+            if (overflows(run, leadDisp, leadDisp + newAdv)) escapeRun(run, show);
+            else inlineRedraw(run, show);
+          } else if (overflows(run, leadDisp, leadDisp + newAdv)) escapeRun(run, await piecesOps(run, rp.pieces, lead, 0));
+          else patch(run, opPrefix(run) + (await piecesOps(run, rp.pieces, lead, tail)));
           if (reflow) {
             const [dx, dy] = unitDir(run);
             const lin = mul(run.tm, run.ctm);
             const scale = Math.hypot(lin[0], lin[1]);
-            const d = (newAdv - run.advance) * scale - rp.gapRemoved;
+            let d = (newAdv - run.advance) * scale - rp.gapRemoved;
+            // a run deleted entirely takes the spacing to the next run with it (its kerning pair is gone)
+            const next = lp.runs[lp.runs.indexOf(rp) + 1]?.run;
+            if (!rp.pieces.some((pc) => pc.items.some((it) => typeof it !== 'number') || pc.text) && next) {
+              const a0 = apply(mul(run.tm, run.ctm), 0, 0), b0 = apply(mul(next.tm, next.ctm), 0, 0);
+              d = -((b0[0] - a0[0]) * dx + (b0[1] - a0[1]) * dy) - rp.gapRemoved;
+            }
             S = [S[0] + dx * d, S[1] + dy * d];
           }
         } else if (Math.abs(lead) > 1e-6) {
-          patch(run, opPrefix(run) + tjOperand([lead, ...run.items, -lead]) + ' TJ');
+          const leadDisp = (-lead / 1000) * run.fs * run.Th;
+          if (run.font.isType3) {
+            const show = await placedOps(run, own(run), lead);
+            if (overflows(run, leadDisp, leadDisp + run.advance)) escapeRun(run, show);
+            else inlineRedraw(run, show);
+          } else if (overflows(run, leadDisp, leadDisp + run.advance)) escapeRun(run, tjOperand([lead, ...run.items]) + ' TJ');
+          else patch(run, opPrefix(run) + tjOperand([lead, ...run.items, -lead]) + ' TJ');
         }
       }
       // the rest of the visual line (other groups/columns stay put)
@@ -566,11 +672,12 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
         const d = (newAdv - run.advance) * Math.hypot(lin[0], lin[1]) - rp.gapRemoved;
         S = [S[0] + dx * d, S[1] + dy * d];
       }
-      const show = await piecesOps(run, rp.pieces, lead, 0);
+      const show = isT3(run, rp.pieces) ? await placedOps(run, rp.pieces, lead) : await piecesOps(run, rp.pieces, lead, 0);
       const stroked = [1, 2, 5, 6].includes(run.Tr);
       const state = edit.color ? rgbOps(edit.color) + ' ' + (stroked ? rgbOps(edit.color, true) + ' ' : '') : '';
-      patch(run, hideRun(run));
-      if (run.Tr < 4) {
+      const leadDisp = (-lead / 1000) * run.fs * run.Th;
+      if (run.Tr < 4 && !overflows(run, leadDisp, leadDisp + newAdv, ident ? undefined : userM)) {
+        patch(run, hideRun(run));
         const local = ident ? '' : `${mat(mul(mul(run.ctm, userM), invert(run.ctm)))} cm `;
         const tmAfter = mul([1, 0, 0, 1, run.advance, 0], run.tm);
         const R = mul(tmAfter, invert(run.tlm));
@@ -582,9 +689,8 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
         const prev = patches.get(run.stream)!.find((p) => p.start === run.start)!;
         prev.text += ` ET q ${gsOp}${local}BT ${mat(run.tm)} Tm ${state}${show} ET Q BT ${restore}`;
       } else {
-        // clipping text modes: draw separately after the page content
-        const color = edit.color ? rgbOps(edit.color) : colorOps(run.color);
-        append += `q ${gsOp}${ident ? '' : mat(userM) + ' cm '}${mat(run.ctm)} cm BT ${nameToken(run.fontKey)} ${fmtNum(run.fs)} Tf ${fmtNum(run.Tc)} Tc ${fmtNum(run.Tw)} Tw ${fmtNum(run.Th * 100)} Tz ${fmtNum(run.Ts)} Ts ${fmtNum(run.Tr)} Tr ${color} ${mat(run.tm)} Tm ${show} ET Q\n`;
+        // clipping text modes, or the text would be cut off by its clip box: draw after the page content
+        escapeRun(run, show, ident ? undefined : userM, edit.color ? rgbOps(edit.color) : undefined, gsOp);
       }
     }
   }
@@ -595,7 +701,13 @@ async function applyContentEdits(bc: BuildCtx, page: PDFPage, model: PageModel, 
     const run = model.runs.find((r) => r.id === rid);
     if (!run) continue;
     const k = kernFor(run, textSpaceShift(run, sh));
-    patch(run, opPrefix(run) + tjOperand([k, ...run.items, -k]) + ' TJ');
+    const kd = (-k / 1000) * run.fs * run.Th;
+    if (run.font.isType3) {
+      const show = await placedOps(run, own(run), k);
+      if (overflows(run, kd, kd + run.advance)) escapeRun(run, show);
+      else inlineRedraw(run, show);
+    } else if (overflows(run, kd, kd + run.advance)) escapeRun(run, tjOperand([k, ...run.items]) + ' TJ');
+    else patch(run, opPrefix(run) + tjOperand([k, ...run.items, -k]) + ' TJ');
   }
 
   for (const xid in xEdits) {

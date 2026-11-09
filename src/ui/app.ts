@@ -3,7 +3,7 @@ import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from 'pdfjs-dist';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings, Font as StdFont, type IFontNames } from '@pdf-lib/standard-fonts';
-import { downloadMatch, prettyName } from './fontmatch.ts';
+import { downloadMatch, prettyName, editorFontFamily, cssWeight } from './fontmatch.ts';
 import { scanDocument, type ScanReport, type DetectedWatermark } from '../engine/watermarks.ts';
 import { fallbackPrefs, SourceDoc, buildPdf, planTextEdit, listFields, unsupportedStandardChars, uprightFrame, STANDARD_FONT_NAMES, type FieldInfo } from '../engine/engine.ts';
 import type { TextGroup, XObjectRun, FillColor } from '../engine/interpreter.ts';
@@ -697,6 +697,13 @@ export class App {
         if (e?.deleted && this.tool !== 'edittext') continue;
         const dx = e?.dx ?? 0, dy = e?.dy ?? 0;
         const r = this.rectPx(v, g.bbox.x0 + dx, g.bbox.y0 + dy, g.bbox.x1 + dx, g.bbox.y1 + dy);
+        if (e?.text !== undefined && !e.fit && Math.abs(g.angle) < 0.01) {
+          // the outline follows the edited text (measured in the editor's font)
+          const f = g.runs[0].font;
+          measureCanvas.font = `${cssWeight(f.baseFont, f.bold)} ${g.visualSize * (e.scale ?? 1) * this.zoom}px ${this.editorFamily(f)}`;
+          const ratio = measureCanvas.measureText(e.text).width / Math.max(1, measureCanvas.measureText(g.text).width);
+          r.width = Math.max(4, r.width * ratio);
+        }
         const sel = this.selection?.kind === 'text' && this.selection.key === key && this.selection.id === g.id;
         const box = h('div', {
           class: `hit text${e ? ' edited' : ''}${sel ? ' selected' : ''}`,
@@ -950,9 +957,10 @@ export class App {
       class: 'editor',
       contentEditable: 'plaintext-only',
       spellcheck: false,
-      style: `left:${r.left - 2}px;top:${r.top + r.height / 2 - size * 0.62}px;min-width:${r.width + 4}px;font-size:${size}px;font-family:${cssFontFamily(font.baseFont, font.serif)};font-weight:${font.bold ? 700 : 400};font-style:${font.italic ? 'italic' : 'normal'};color:${color}`,
+      style: `left:${r.left - 2}px;top:${r.top + r.height / 2 - size * 0.62}px;min-width:${r.width + 4}px;font-size:${size}px;font-family:${this.editorFamily(font)};font-weight:${cssWeight(font.baseFont, font.bold)};font-style:${font.italic ? 'italic' : 'normal'};color:${color}`,
     });
     if (ed.contentEditable !== 'plaintext-only') ed.contentEditable = 'true';
+    ed.style.background = this.pageColorAround(v, r);
     ed.textContent = cur.text ?? g.text;
     const status = h('div', { class: 'editor-status' });
     const updateStatus = () => {
@@ -1012,6 +1020,43 @@ export class App {
     const sel = window.getSelection();
     sel?.removeAllRanges();
     sel?.addRange(range);
+  }
+
+  /** most common page colour along the border of a box (what's behind the text) */
+  pageColorAround(v: PageView, r: { left: number; top: number; width: number; height: number }): string {
+    const c = v.canvas;
+    if (!c) return '#fff';
+    try {
+      const k = c.width / v.el.clientWidth;
+      const ctx = c.getContext('2d', { willReadFrequently: true })!;
+      const counts = new Map<string, number>();
+      const pts: [number, number][] = [];
+      for (let i = 0; i <= 16; i++) {
+        const x = r.left + (r.width * i) / 16;
+        pts.push([x, r.top - 2], [x, r.top + r.height + 2]);
+      }
+      for (let i = 0; i <= 6; i++) {
+        const y = r.top + (r.height * i) / 6;
+        pts.push([r.left - 3, y], [r.left + r.width + 3, y]);
+      }
+      for (const [x, y] of pts) {
+        const d = ctx.getImageData(Math.max(0, Math.round(x * k)), Math.max(0, Math.round(y * k)), 1, 1).data;
+        const key = `${d[0] >> 3},${d[1] >> 3},${d[2] >> 3}`;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      const best = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0].split(',').map((n) => (+n << 3) + 4);
+      return `rgb(${best.join(',')})`;
+    } catch {
+      return '#fff';
+    }
+  }
+
+  /** the editor shows the real typeface: matched/uploaded font, else the fetched open font, else installed */
+  editorFamily(font: { baseFont: string; displayName: string; serif: boolean }) {
+    const generic = cssFontFamily(font.baseFont, font.serif).split(', ').pop()!;
+    const matched = this.state.fontMatches[font.displayName]?.split('|')[0];
+    const base = this.autoFonts ? editorFontFamily(font.baseFont, generic) : cssFontFamily(font.baseFont, font.serif);
+    return matched?.startsWith('asset:') ? `"${matched}", ${base}` : base;
   }
 
   updateTextEdit(key: string, gid: string, fn: (e: TextEdit) => void) {
@@ -1360,6 +1405,7 @@ export class App {
         rangeRow('Opacity', +(e.opacity ?? run.alpha).toFixed(2), 0, 1, 0.01, (n) => this.updateTextEdit(key, gid, (x) => { x.opacity = Math.abs(n - run.alpha) < 1e-3 ? undefined : n; }), true),
         h('div', { class: 'row' }, h('label', {}, 'Rotate°'), h('input', { type: 'number', step: '1', value: String(e.rotate ?? 0), onchange: (ev: Event) => { const v = parseFloat((ev.target as HTMLInputElement).value) || 0; this.updateTextEdit(key, gid, (x) => { x.rotate = v || undefined; }); } })),
         h('div', { class: 'hint', style: 'margin:-2px 0 8px' }, 'Untouched properties are inherited from the original – colour space, shade, transparency and layering stay exactly as they were.'),
+        h('div', { class: 'row' }, h('label', {}, 'Fit width'), h('input', { type: 'checkbox', checked: !!e.fit, onchange: (ev: Event) => this.updateTextEdit(key, gid, (x) => { x.fit = (ev.target as HTMLInputElement).checked || undefined; }) }), h('span', { class: 'hint' }, 'shrink longer text to the original width')),
         h('div', { class: 'row' }, h('label', {}, 'Reflow'), h('input', { type: 'checkbox', checked: !e.noReflow, onchange: (ev: Event) => this.updateTextEdit(key, gid, (x) => { x.noReflow = (ev.target as HTMLInputElement).checked ? undefined : true; }) }), h('span', { class: 'hint' }, 'slide the rest of the line')),
       ),
       h('div', { class: 'sec' }, h('h4', {}, 'Font'),

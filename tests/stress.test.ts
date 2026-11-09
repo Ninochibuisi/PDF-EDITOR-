@@ -5,6 +5,14 @@ import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import './register-fonts.ts';
 import { SourceDoc, buildPdf, planTextEdit } from '../src/engine/engine.ts';
 import { emptyState } from '../src/engine/model.ts';
+import { mul, type TextRun } from '../src/engine/interpreter.ts';
+
+/** page text in reading order (rows top→bottom, glyph runs left→right) */
+function visualText(runs: TextRun[]): string {
+  const pts = runs.filter((r) => r.text.trim()).map((r) => { const m = mul(r.tm, r.ctm); return { r, x: m[4], y: m[5] }; });
+  pts.sort((a, b) => (Math.abs(a.y - b.y) > 3 ? b.y - a.y : a.x - b.x));
+  return pts.map((p) => p.r.text).join('').replace(/\s+/g, '');
+}
 
 let bad = 0;
 for (const f of readdirSync('tests/fixtures').filter((x) => x.endsWith('.pdf'))) {
@@ -34,7 +42,7 @@ for (const f of readdirSync('tests/fixtures').filter((x) => x.endsWith('.pdf')))
     const doc = await pdfjs.getDocument({ data: out.slice(), verbosity: 0 }).promise;
     const tc = await (await doc.getPage(1)).getTextContent();
     const re = await SourceDoc.open({ id: 'r', name: 'r', bytes: out });
-    const all = (tc.items as { str: string }[]).map((i) => i.str).join('').replace(/\s+/g, '') + '\n' + re.model(0).groups.map((g) => g.text).join('').replace(/\s+/g, '');
+    const all = (tc.items as { str: string }[]).map((i) => i.str).join('').replace(/\s+/g, '') + '\n' + re.model(0).groups.map((g) => g.text).join('').replace(/\s+/g, '') + '\n' + visualText(re.model(0).runs);
     for (const e of expect) {
       if (all.includes(e.slice(0, 30))) ok++;
       else { bad++; console.log(`   ✘ ${f} p${p} missing: ${e.slice(0, 50)}`); }

@@ -98,6 +98,44 @@ console.log('\nChrome / Google Docs Type3 fonts');
   check(p3.substituteFont === 'Helvetica-Bold', 'document-wide font match is used for missing characters');
 }
 
+console.log('\nlonger text inside a clipped box (web/app exports with overflow:hidden)');
+{
+  const { src } = await open('tests/fixtures/receipt.pdf');
+  const g = src.model(0).groups.find((x) => x.text.includes('12,000'))!;
+  check(!!g.runs[0].clip, 'clip box detected around the amount');
+  const build = async (e: TextEdit) => {
+    const st = emptyState();
+    st.pages = [{ key: 's0:0', rotate: 0 }];
+    st.textEdits['s0:0'] = { [g.id]: e };
+    return buildPdf(new Map([['s0', src]]), 's0', st, new Map());
+  };
+  const grown = await build({ text: '₦120,000,000' });
+  const fit = await build({ text: '₦120,000,000', fit: true });
+  if (hasPoppler) {
+    const ink = (b: Uint8Array, name: string) => {
+      writeFileSync(`tests/out/${name}.pdf`, b);
+      execFileSync('pdftoppm', ['-r', '72', '-singlefile', `tests/out/${name}.pdf`, `tests/out/${name}`]);
+      const buf = readFileSync(`tests/out/${name}.ppm`);
+      const hdr = buf.subarray(0, 20).toString('latin1').split(/\s+/);
+      const w = +hdr[1], off = buf.length - w * +hdr[2] * 3;
+      const c = g.runs[0].clip!;
+      let right = 0, maxX = 0; let green: number[] = [];
+      for (let y = Math.floor(842 - c.y1); y < Math.ceil(842 - c.y0); y++)
+        for (let x = 0; x < w; x++) {
+          const k = off + (y * w + x) * 3;
+          if (buf[k + 1] - buf[k] > 60) { maxX = Math.max(maxX, x); if (x > c.x1 + 2) right++; if (!green.length || buf[k] + buf[k + 2] < green[0] + green[2]) green = [buf[k], buf[k + 1], buf[k + 2]]; }
+        }
+      return { right, maxX, green, clipX: c.x1 };
+    };
+    const o = ink(await (async () => { const st = emptyState(); st.pages = [{ key: 's0:0', rotate: 0 }]; return buildPdf(new Map([['s0', src]]), 's0', st, new Map()); })(), 'clip_o');
+    const a = ink(grown, 'clip_a');
+    const f = ink(fit, 'clip_f');
+    check(a.right > 50, `grown amount is fully visible past the old clip edge (${a.right} green px beyond x=${Math.round(a.clipX)})`);
+    check(a.green.every((v, i) => Math.abs(v - o.green[i]) <= 2), `same green as the original (${o.green} → ${a.green})`);
+    check(f.maxX <= o.maxX + 2, `"fit width" keeps it inside the original width (${f.maxX} ≤ ${o.maxX})`);
+  }
+}
+
 if (hasPoppler) {
   console.log('\npixels of untouched symbols');
   const render = (b: Uint8Array, name: string) => {

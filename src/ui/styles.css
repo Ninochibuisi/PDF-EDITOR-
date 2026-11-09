@@ -74,6 +74,7 @@ svg.i { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-widt
 .mode-edittext .hit.text { cursor: text; outline: 1px dashed #7c5cff55; }
 .mode-edittext .hit.text:hover { background: #7c5cff22; outline: 1.5px solid var(--accent); }
 .hit.text.edited { outline: 1px solid #3ecf8e88 !important; }
+.hit.text.selected { background: transparent !important; }
 .hit.text.selected, .hit.obj.selected, .hit.ov.selected { outline: 2px solid var(--accent) !important; background: #7c5cff14; }
 .mode-objects .hit.obj { cursor: move; outline: 1px dashed #4fd1ff88; }
 .mode-objects .hit.obj:hover { background: #4fd1ff22; outline: 1.5px solid #4fd1ff; }
@@ -85,6 +86,7 @@ svg.inkdraft { position: absolute; inset: 0; pointer-events: none; overflow: vis
 
 .editor { position: absolute; z-index: 20; min-width: 40px; padding: 0 2px; background: #fffffff2; color: #000; outline: 2px solid var(--accent); border-radius: 2px; white-space: pre; line-height: 1.15; box-shadow: 0 6px 20px #0005; }
 .editor:focus { outline: 2px solid var(--accent); }
+.editor::selection, .editor *::selection { background: rgba(124, 92, 255, 0.28); color: inherit; }
 .editor-status { position: absolute; z-index: 21; font-size: 11px; padding: 3px 8px; border-radius: 6px; white-space: nowrap; background: #000d; color: white; pointer-events: none; }
 .editor-status.ok { background: #0d3b28f0; color: #8ff0c4; }
 .editor-status.warn { background: #3d2c06f0; color: #ffd98a; }

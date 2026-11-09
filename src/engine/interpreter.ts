@@ -78,6 +78,8 @@ export interface TextRun {
   tlm: Matrix;
   /** id of the enclosing watermark artifact block, if any */
   wm?: string;
+  /** clipping box in effect (user space), if any */
+  clip?: BBox;
   /** show operands as strings/numbers, in order */
   items: (Uint8Array | number)[];
   units: RunUnit[];
@@ -188,6 +190,7 @@ interface GState {
   font?: PdfFont;
   fs: number;
   alpha: number;
+  clip?: BBox;
 }
 
 const num = (o: Operand | undefined) => (o && o.kind === 'num' ? o.value : 0);
@@ -232,6 +235,14 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
   const propDict = getDict(ctx, resources, 'Properties');
   const blocks: MarkedBlock[] = [];
   const mcStack: { wm: boolean; s: number; i: number; start: number; label: string }[] = [];
+  // current path bounds (user space) – used to know the clipping box
+  let pathBox: BBox | undefined;
+  let pendingClip = false;
+  const addPt = (x: number, y: number) => {
+    const [ux, uy] = apply(gs.ctm, x, y);
+    if (!pathBox) pathBox = { x0: ux, y0: uy, x1: ux, y1: uy };
+    else { pathBox.x0 = Math.min(pathBox.x0, ux); pathBox.y0 = Math.min(pathBox.y0, uy); pathBox.x1 = Math.max(pathBox.x1, ux); pathBox.y1 = Math.max(pathBox.y1, uy); }
+  };
   const currentWm = () => {
     for (let k = mcStack.length - 1; k >= 0; k--) if (mcStack[k].wm) return `mc:${mcStack[k].s}:${mcStack[k].i}`;
     return undefined;
@@ -284,7 +295,7 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
       id: `${s}:${i}`, stream: s, opIndex: i, start: op.start, end: op.end, op: op.op, quoteArgs,
       fontKey: gs.fontKey, font, fs: gs.fs, Tc: gs.Tc, Tw: gs.Tw, Th: gs.Th, TL: gs.TL, Ts: gs.Ts, Tr: gs.Tr,
       ctm: gs.ctm, tm: startTm, glyphs, text: units.map((u) => u.text).join(''), advance: adv, items: rawItems, units, trailing: pre,
-      color: { ...gs.fill, comps: gs.fill.comps.slice() }, alpha: gs.alpha, tlm, wm: currentWm(), bt, quad, bbox: quadToBBox(quad),
+      color: { ...gs.fill, comps: gs.fill.comps.slice() }, alpha: gs.alpha, clip: gs.clip, tlm, wm: currentWm(), bt, quad, bbox: quadToBBox(quad),
     });
   };
 
@@ -294,6 +305,24 @@ export function interpretPage(doc: PDFDocument, pageIndex: number, fonts: FontCa
       const a = op.operands;
       switch (op.op) {
         case 'q': stack.push({ ...gs }); break;
+        case 'm': case 'l': addPt(num(a[0]), num(a[1])); break;
+        case 'c': addPt(num(a[0]), num(a[1])); addPt(num(a[2]), num(a[3])); addPt(num(a[4]), num(a[5])); break;
+        case 'v': case 'y': addPt(num(a[0]), num(a[1])); addPt(num(a[2]), num(a[3])); break;
+        case 're': {
+          const x = num(a[0]), y = num(a[1]), w = num(a[2]), hh = num(a[3]);
+          addPt(x, y); addPt(x + w, y); addPt(x, y + hh); addPt(x + w, y + hh);
+          break;
+        }
+        case 'W': case 'W*': pendingClip = true; break;
+        case 'n': case 'f': case 'F': case 'f*': case 'S': case 's': case 'B': case 'B*': case 'b': case 'b*': {
+          if (pendingClip && pathBox) {
+            const c = gs.clip;
+            gs.clip = c ? { x0: Math.max(c.x0, pathBox.x0), y0: Math.max(c.y0, pathBox.y0), x1: Math.min(c.x1, pathBox.x1), y1: Math.min(c.y1, pathBox.y1) } : { ...pathBox };
+          }
+          pendingClip = false;
+          pathBox = undefined;
+          break;
+        }
         case 'Q': if (stack.length) gs = stack.pop()!; break;
         case 'cm': gs.ctm = mul([num(a[0]), num(a[1]), num(a[2]), num(a[3]), num(a[4]), num(a[5])], gs.ctm); break;
         case 'g': gs.fill = { op: 'g', comps: [num(a[0])] }; gs.fillCS = 'DeviceGray'; break;
