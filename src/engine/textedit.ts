@@ -50,6 +50,8 @@ export interface LinePlan {
   fallbackFonts: string[];
   /** characters taken from another subset of the same typeface elsewhere in the document */
   borrowedChars: string[];
+  /** missing characters per embedded font (display name) */
+  missingByFont: Record<string, string[]>;
 }
 
 const BUNDLED_SANS = 'bundled:DejaVuSans';
@@ -120,7 +122,7 @@ export interface FallbackPrefs {
 
 export function planLine(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [], prefs: FallbackPrefs = {}): LinePlan {
   const restyle = !!(edit.dx || edit.dy || edit.rotate || (edit.scale && edit.scale !== 1) || edit.color || edit.opacity !== undefined || edit.forceFallback);
-  const plan: LinePlan = { deleted: !!edit.deleted, restyle, runs: [], fallbackChars: [], fallbackFonts: [], borrowedChars: [] };
+  const plan: LinePlan = { deleted: !!edit.deleted, restyle, runs: [], fallbackChars: [], fallbackFonts: [], borrowedChars: [], missingByFont: {} };
   const runs = group.runs;
   if (edit.deleted) {
     plan.runs = runs.map((run, idx) => ({ idx, run, changed: true, pieces: [], gapRemoved: 0 }));
@@ -227,11 +229,15 @@ export function planLine(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [],
             continue;
           }
           // 5: fallback for this character only
-          const matched = prefs.matches?.[run.font.displayName];
-          const name = edit.fallbackFont ?? (matched && (prefs.covers?.(matched, ch) ?? true) ? matched : autoFallback(ch, run.font));
+          // a matched font may come in several parts (e.g. latin + latin-ext); use the first that has the glyph
+          const matched = prefs.matches?.[run.font.displayName]?.split('|').find((m) => prefs.covers?.(m, ch) ?? true);
+          const name = edit.fallbackFont ?? matched ?? autoFallback(ch, run.font);
           const pc = piece({ kind: 'lib', name });
           pc.text += ch;
-          if (!/\s/.test(ch)) plan.fallbackChars.push(ch);
+          if (!/\s/.test(ch)) {
+            plan.fallbackChars.push(ch);
+            (plan.missingByFont[run.font.displayName] ??= []).push(ch);
+          }
           if (!plan.fallbackFonts.includes(name)) plan.fallbackFonts.push(name);
           c++;
         }

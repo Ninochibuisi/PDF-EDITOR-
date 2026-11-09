@@ -112,14 +112,16 @@ export interface EditPlan {
   substituteFont?: string;
   /** characters borrowed from another subset of the same typeface in the document */
   borrowed: string[];
+  /** characters each embedded font is missing (by font display name) */
+  missingByFont: Record<string, string[]>;
 }
 
 export function planTextEdit(group: TextGroup, edit: TextEdit, pool: PdfFont[] = [], prefs: FallbackPrefs = {}): EditPlan {
-  if (edit.deleted) return { mode: 'delete', missing: [], borrowed: [] };
+  if (edit.deleted) return { mode: 'delete', missing: [], borrowed: [], missingByFont: {} };
   const lp = planLine(group, edit, pool, prefs);
   if (lp.fallbackChars.length || edit.forceFallback)
-    return { mode: 'substitute', missing: lp.fallbackChars, substituteFont: lp.fallbackFonts.join(', '), borrowed: lp.borrowedChars };
-  return { mode: lp.restyle ? 'reemit-original' : 'inplace', missing: [], borrowed: lp.borrowedChars };
+    return { mode: 'substitute', missing: lp.fallbackChars, substituteFont: lp.fallbackFonts.join(', '), borrowed: lp.borrowedChars, missingByFont: lp.missingByFont };
+  return { mode: lp.restyle ? 'reemit-original' : 'inplace', missing: [], borrowed: lp.borrowedChars, missingByFont: {} };
 }
 
 // ---------------------------------------------------------------------------

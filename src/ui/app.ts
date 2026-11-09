@@ -3,7 +3,7 @@ import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from 'pdfjs-dist';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { Encodings, Font as StdFont, type IFontNames } from '@pdf-lib/standard-fonts';
-import { parseFontProgram } from '../engine/fontprog.ts';
+import { downloadMatch, prettyName } from './fontmatch.ts';
 import { scanDocument, type ScanReport, type DetectedWatermark } from '../engine/watermarks.ts';
 import { fallbackPrefs, SourceDoc, buildPdf, planTextEdit, listFields, unsupportedStandardChars, uprightFrame, STANDARD_FONT_NAMES, type FieldInfo } from '../engine/engine.ts';
 import type { TextGroup, XObjectRun, FillColor } from '../engine/interpreter.ts';
@@ -67,6 +67,11 @@ export class App {
   currentPage = 0;
   tab: 'props' | 'find' | 'wm' | 'forms' | 'doc' = 'props';
   report?: ScanReport;
+  autoFonts = (() => { try { return localStorage.getItem('dpe.autoFonts') !== '0'; } catch { return true; } })();
+  private autoMatched = new Set<string>();
+  private fontJobs = new Map<string, Promise<'new' | 'failed' | 'none'>>();
+  private fontFailed = new Set<string>();
+  fontPending = new Set<string>();
   scanning = false;
   wmOpen: string | null = null;
   fields: FieldInfo[] = [];
@@ -436,6 +441,7 @@ export class App {
     this.built = doc;
     this.builtBytes = bytes;
     await this.layout(structural);
+    this.autoMatchEdits();
     this.setStatus(`${this.state.pages.length} page${this.state.pages.length === 1 ? '' : 's'} · ${(bytes.length / 1024).toFixed(0)} KB`);
     setTimeout(() => old?.destroy(), 1500);
   }
@@ -933,6 +939,7 @@ export class App {
     const key = v.slot.key;
     this.select({ kind: 'text', key, id: g.id }, false);
     const cur = this.state.textEdits[key]?.[g.id] ?? {};
+    const edit0 = cur;
     if (cur.deleted) return;
     const dx = cur.dx ?? 0, dy = cur.dy ?? 0;
     const r = this.rectPx(v, g.bbox.x0 + dx, g.bbox.y0 + dy, g.bbox.x1 + dx, g.bbox.y1 + dy);
@@ -953,7 +960,17 @@ export class App {
       const bottom = r.top + r.height / 2 + size * 0.75;
       status.style.left = r.left + 'px';
       status.style.top = bottom + 4 + 'px';
-      if (plan.mode === 'substitute') {
+      for (const f in plan.missingByFont) this.ensureFontMatch(f, plan.missingByFont[f]).then((r) => r !== 'none' && ed.isConnected && updateStatus());
+      if (plan.mode === 'substitute' && plan.missing.length && (plan.substituteFont ?? '').split(', ').every((n) => n.startsWith('asset:'))) {
+        status.className = 'editor-status ok';
+        status.textContent = `✓ ${quoteChars(plan.missing)} drawn with ${this.fontLabel(plan.substituteFont!.split(', ')[0])} – matches the document · Enter to apply`;
+      } else if (plan.mode === 'substitute' && Object.keys(plan.missingByFont).some((f) => this.fontPending.has(f))) {
+        status.className = 'editor-status';
+        status.textContent = `⏳ Fetching the matching font for ${quoteChars(plan.missing)}… (you can keep typing)`;
+      } else if (plan.mode === 'substitute' && !edit0.fallbackFont && Object.keys(plan.missingByFont).every((f) => !this.state.fontMatches[f])) {
+        status.className = 'editor-status warn';
+        status.textContent = `⚠ ${quoteChars(plan.missing)} isn't in this PDF and the matching font couldn't be downloaded (offline?) → using ${this.fontLabel(plan.substituteFont ?? '')} for ${plan.missing.length > 1 ? 'them' : 'it'} only. Use “Use installed font” / “Upload font file” in the Edit panel for an exact match.`;
+      } else if (plan.mode === 'substitute') {
         status.className = 'editor-status warn';
         status.textContent = `⚠ ${quoteChars(plan.missing)} ${plan.missing.length > 1 ? 'are' : 'is'} not in this PDF's fonts → drawn with ${this.fontLabel(plan.substituteFont ?? '')}; everything else untouched. Pick the exact font in the Edit panel.`;
       } else {
@@ -1317,7 +1334,7 @@ export class App {
     const status =
       plan.mode === 'delete' ? h('span', { class: 'pill warn' }, 'Deleted')
       : plan.mode === 'substitute' && plan.missing.length && (plan.substituteFont ?? '').startsWith('asset:') && !plan.substituteFont!.includes(',')
-        ? h('span', { class: 'pill ok', style: 'white-space:normal' }, `✓ ${quoteChars(plan.missing)} drawn with ${this.fontLabel(plan.substituteFont!)} (your matched font) — the rest is untouched`)
+        ? h('span', { class: 'pill ok', style: 'white-space:normal' }, `✓ ${quoteChars(plan.missing)} drawn with ${this.fontLabel(plan.substituteFont!)}${this.autoMatched.has(font.displayName) ? ' (matched automatically)' : ''} — the rest is untouched`)
       : plan.mode === 'substitute' ? h('span', { class: 'pill warn', style: 'white-space:normal' }, plan.missing.length ? `Not in this PDF's font: ${quoteChars(plan.missing)} — only ${plan.missing.length > 1 ? 'these use' : 'this uses'} ${this.fontLabel(plan.substituteFont ?? '')}, the rest is untouched` : 'Fallback font forced')
       : e.text !== undefined || plan.mode === 'reemit-original' ? h('span', { class: 'pill ok' }, '✓ Edited in original font')
       : h('span', { class: 'pill info' }, 'Original');
@@ -1357,9 +1374,9 @@ export class App {
           : 'Characters you type are encoded in this embedded font.'),
         h('div', { class: 'sec', style: 'margin:10px 0 0;padding:10px;border:1px solid var(--line);border-radius:8px' },
           h('div', { style: 'font-weight:600;margin-bottom:6px' }, `Missing characters of ${font.displayName}`),
-          h('div', { class: 'hint', style: 'margin-bottom:8px' }, `Used for every line in this font: ${this.fontLabel(this.state.fontMatches[font.displayName] ?? 'automatic')}`),
+          h('div', { class: 'hint', style: 'margin-bottom:8px' }, this.fontPending.has(font.displayName) ? '⏳ Fetching the matching font…' : `Used for every line in this font: ${this.fontLabel(this.state.fontMatches[font.displayName] ?? 'automatic')}${this.autoMatched.has(font.displayName) ? ' (matched automatically)' : ''}`),
           h('div', { class: 'btns' },
-            h('button', { class: 'btn small primary', onclick: () => this.fetchExactFont(font.displayName, plan.missing) }, `Download ${prettyName(font.displayName)}`),
+            h('button', { class: 'btn small primary', onclick: () => this.ensureFontMatch(font.displayName, plan.missing.length ? plan.missing : [','], true) }, this.fontPending.has(font.displayName) ? 'Matching…' : `Match ${prettyName(font.displayName)} now`),
             'queryLocalFonts' in window ? h('button', { class: 'btn small', onclick: () => this.matchLocalFont(font.displayName, (id) => this.setFontMatch(font.displayName, 'asset:' + id)) }, 'Use installed font') : null,
             h('button', { class: 'btn small', onclick: () => this.uploadFont((id) => this.setFontMatch(font.displayName, 'asset:' + id)) }, 'Upload font file…'),
           ),
@@ -1371,6 +1388,7 @@ export class App {
   }
 
   setFontMatch(fontName: string, value: string | undefined) {
+    this.autoMatched.delete(fontName);
     this.commit((s) => {
       if (value) s.fontMatches[fontName] = value;
       else delete s.fontMatches[fontName];
@@ -1379,37 +1397,65 @@ export class App {
   }
 
   fontLabel(name: string) {
-    if (name.startsWith('asset:')) return this.assets.get(name.slice(6))?.name ?? 'uploaded font';
+    name = name.split('|')[0];
+    if (name.startsWith('asset:')) return (this.assets.get(name.slice(6))?.name ?? 'uploaded font').replace(/ \((latin-ext|cyrillic|greek|vietnamese)\)$/, '');
     return prettyFont(name);
   }
 
-  /** Download the exact typeface from the Fontsource CDN (Google Fonts & other open fonts) – opt-in. */
-  async fetchExactFont(displayName: string, need: string[]) {
-    const { family, weight, italic } = parseFontName(displayName);
-    const id = family.replace(/([a-z0-9])([A-Z])/g, '$1 $2').trim().toLowerCase().replace(/\s+/g, '-');
-    if (!confirm(`Download “${family}” (weight ${weight}${italic ? ', italic' : ''}) from the Fontsource font CDN (cdn.jsdelivr.net)?\n\nOnly the font name is requested – your document never leaves this device. Works for Google Fonts and other open-licence fonts (Roboto, Open Sans, Inter, Lato, Montserrat, Poppins, Noto…). Commercial fonts like Calibri or Arial are not available – use "Use installed font" or "Upload font file" for those.`)) return;
-    const chars = [...new Set(need.length ? need : [','])];
-    const subsets = ['latin', 'latin-ext', 'cyrillic', 'greek', 'vietnamese'];
-    this.setStatus(`Downloading ${family}…`, true);
-    let best: { bytes: Uint8Array; subset: string; covered: number } | undefined;
-    for (const subset of subsets) {
-      try {
-        const url = `https://cdn.jsdelivr.net/fontsource/fonts/${id}@latest/${subset}-${weight}-${italic ? 'italic' : 'normal'}.ttf`;
-        const r = await fetch(url);
-        if (!r.ok) continue;
-        const bytes = new Uint8Array(await r.arrayBuffer());
-        const cm = parseFontProgram(bytes, 'FontFile2')?.unicodeCmap;
-        const covered = cm ? chars.filter((c) => cm.has(c.codePointAt(0)!)).length : 0;
-        if (!best || covered > best.covered) best = { bytes, subset, covered };
-        if (covered === chars.length) break;
-      } catch { /* try the next subset */ }
+  /**
+   * Automatic font matching: when a character is missing from an embedded font, fetch the real
+   * typeface (or its metric twin) once, cache it, and use it for every line in that font.
+   * Resolves true only when a new font was added.
+   */
+  ensureFontMatch(fontName: string, need: string[], force = false): Promise<'new' | 'failed' | 'none'> {
+    const chars = [...new Set(need)].filter((c) => !/\s/.test(c));
+    if ((!this.autoFonts && !force) || !chars.length) return Promise.resolve('none');
+    const cur = this.state.fontMatches[fontName];
+    if (cur && !this.autoMatched.has(fontName)) return Promise.resolve('none'); // the user chose a font – respect it
+    const prefs = fallbackPrefs(this.state, this.assets);
+    const todo = chars.filter((c) => !cur?.split('|').some((m) => prefs.covers!(m, c)));
+    if (!todo.length) return Promise.resolve('none'); // already matched – nothing new
+    const jobKey = fontName + '|' + todo.sort().join('');
+    if (this.fontFailed.has(jobKey) && !force) return Promise.resolve('none');
+    let job = this.fontJobs.get(jobKey);
+    if (job) return job;
+    job = (async () => {
+      this.fontPending.add(fontName);
+      this.setStatus(`Matching ${prettyName(fontName)}…`, true);
+      const { parts } = await downloadMatch(fontName, todo);
+      this.fontPending.delete(fontName);
+      this.setStatus('Ready');
+      if (!parts.length) {
+        this.fontFailed.add(jobKey);
+        if (force) toast(`No open version of ${prettyName(fontName)} is available (or you are offline). Use “Use installed font” or “Upload font file”.`, true, 6000);
+        this.renderTabs();
+        return 'failed' as const;
+      }
+      const ids = parts.map((p) => this.addFontAsset(p.bytes, p.label, true)).filter((x): x is string => !!x);
+      const list = [...new Set([...(this.state.fontMatches[fontName]?.split('|') ?? []), ...ids.map((i) => 'asset:' + i)])];
+      this.state.fontMatches[fontName] = list.join('|');
+      this.autoMatched.add(fontName);
+      this.scheduleBuild();
+      this.renderTabs();
+      return 'new' as const;
+    })();
+    this.fontJobs.set(jobKey, job);
+    job.finally(() => this.fontJobs.delete(jobKey));
+    return job;
+  }
+
+  /** after every build: auto-match fonts for any edited line that still needs a fallback */
+  autoMatchEdits() {
+    if (!this.autoFonts) return;
+    for (const key in this.state.textEdits) {
+      const groups = this.groupsOf(key);
+      for (const gid in this.state.textEdits[key]) {
+        const g = groups.find((x) => x.id === gid);
+        if (!g) continue;
+        const plan = planTextEdit(g, this.state.textEdits[key][gid], this.fontPool(key), fallbackPrefs(this.state, this.assets));
+        for (const f in plan.missingByFont) this.ensureFontMatch(f, plan.missingByFont[f]);
+      }
     }
-    this.setStatus('Ready');
-    if (!best) return toast(`“${family}” isn't available on Fontsource. Use "Use installed font" or "Upload font file" instead.`, true, 6000);
-    const assetId = this.addFontAsset(best.bytes, `${family} ${weight}${italic ? ' italic' : ''}`);
-    if (!assetId) return;
-    this.setFontMatch(displayName, 'asset:' + assetId);
-    if (best.covered < chars.length) toast(`${family} has no glyph for ${quoteChars(chars.filter((c) => !parseFontProgram(best!.bytes, 'FontFile2')?.unicodeCmap?.has(c.codePointAt(0)!)))} – those use the automatic fallback`, true, 6000);
   }
 
   renderObjProps(key: string, id: string) {
@@ -1487,7 +1533,7 @@ export class App {
     if (id) done(id);
   }
 
-  addFontAsset(bytes: Uint8Array, name: string): string | undefined {
+  addFontAsset(bytes: Uint8Array, name: string, silent = false): string | undefined {
     try {
       const fk = (fontkit as unknown as { create(b: Uint8Array): unknown }).create(bytes) as unknown as { layout?: unknown; fonts?: unknown };
       if (!fk.layout) throw new Error('font collections (.ttc) are not supported');
@@ -1501,7 +1547,7 @@ export class App {
       const ff = new FontFace('asset:' + a.id, bytes as BufferSource);
       ff.load().then((x) => document.fonts.add(x)).catch(() => {});
     } catch { /* display only */ }
-    toast(`Font “${name}” loaded`);
+    if (!silent) toast(`Font “${name}” loaded`);
     return a.id;
   }
 
@@ -1794,6 +1840,10 @@ export class App {
         h('button', { class: 'btn small', onclick: () => this.exportPdf('compat') }, 'Max compatibility'),
         h('button', { class: 'btn small', onclick: () => this.exportPng() }, icon('png'), 'Page as PNG')),
       h('div', { class: 'hint', style: 'margin-top:8px' }, h('b', {}, 'Lossless'), ' keeps every byte of the original file and appends only your changes (incremental update) – images, fonts, colour profiles and everything you didn\'t touch stay bit-identical. ', h('b', {}, 'Rebuilt'), ' rewrites the file compactly with the same content.')));
+    b.append(h('div', { class: 'sec' }, h('h4', {}, 'Fonts'),
+      h('label', { class: 'row', style: 'gap:8px;align-items:flex-start' },
+        h('input', { type: 'checkbox', checked: this.autoFonts, onchange: (e: Event) => { this.autoFonts = (e.target as HTMLInputElement).checked; try { localStorage.setItem('dpe.autoFonts', this.autoFonts ? '1' : '0'); } catch { /* ignore */ } if (this.autoFonts) this.autoMatchEdits(); } }),
+        h('span', { class: 'hint' }, 'Automatically match fonts: when you type a character the PDF\'s font doesn\'t contain, fetch the real typeface (or its metric-identical twin for Arial, Times New Roman, Calibri…) from Fontsource, once, cached for offline use. Only the font name is sent – never your document.'))));
     if (this.report) {
       const r = this.report;
       b.append(h('div', { class: 'sec' }, h('h4', {}, 'Smart scan'), h('div', { class: 'kv' },
@@ -1891,22 +1941,6 @@ export function fillToRgb(c: FillColor): RGB {
 function quoteChars(chars: string[]) {
   const names: Record<string, string> = { ',': 'comma', '.': 'full stop', ';': 'semicolon', ':': 'colon', "'": 'apostrophe', '"': 'quote', '-': 'hyphen', ' ': 'space' };
   return [...new Set(chars)].map((c) => `“${c}”${names[c] ? ` (${names[c]})` : ''}`).join(', ');
-}
-
-/** "AAAAAA+Roboto-MediumItalic" -> family Roboto, weight 500, italic */
-function parseFontName(n: string): { family: string; weight: number; italic: boolean } {
-  const clean = n.replace(/^[A-Z]{6}\+/, '').replace(/,/g, '-').replace(/(MT|PS)$/, '');
-  const m = /^(.*?)[-_ ]?((?:Thin|Hairline|ExtraLight|UltraLight|Light|Regular|Book|Normal|Roman|Medium|SemiBold|DemiBold|Semibold|Demibold|ExtraBold|UltraBold|Bold|Black|Heavy)?(?:Italic|Oblique|It)?)$/.exec(clean);
-  const family = (m?.[1] || clean).replace(/[-_]+$/, '') || clean;
-  const style = (m?.[2] || '').toLowerCase();
-  const weights: [RegExp, number][] = [[/thin|hairline/, 100], [/extralight|ultralight/, 200], [/light/, 300], [/medium/, 500], [/semibold|demibold/, 600], [/extrabold|ultrabold/, 800], [/bold/, 700], [/black|heavy/, 900]];
-  const weight = weights.find(([re]) => re.test(style))?.[1] ?? 400;
-  return { family, weight, italic: /italic|oblique|it$/.test(style) };
-}
-function prettyName(n: string) {
-  const p = parseFontName(n);
-  const w: Record<number, string> = { 100: 'Thin', 200: 'ExtraLight', 300: 'Light', 400: '', 500: 'Medium', 600: 'SemiBold', 700: 'Bold', 800: 'ExtraBold', 900: 'Black' };
-  return [p.family.replace(/([a-z0-9])([A-Z])/g, '$1 $2'), w[p.weight], p.italic ? 'Italic' : ''].filter(Boolean).join(' ');
 }
 
 function prettyFont(n: string) {
